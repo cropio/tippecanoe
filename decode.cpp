@@ -246,6 +246,9 @@ void decode(char *fname, int z, unsigned x, unsigned y, std::set<std::string> co
 	}
 }
 
+#ifdef TARGET_OS_IPHONE
+// TODO: Add ios func's
+#else
 void usage(char **argv) {
 	fprintf(stderr, "Usage: %s [-s projection] [-Z minzoom] [-z maxzoom] [-l layer ...] file.mbtiles [zoom x y]\n", argv[0]);
 	exit(EXIT_FAILURE);
@@ -323,3 +326,4 @@ int main(int argc, char **argv) {
 
 	return 0;
 }
+#endif

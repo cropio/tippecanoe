@@ -112,6 +112,9 @@ void process(FILE *fp, const char *fname) {
 	json_end(jp);
 }
 
+#ifdef TARGET_OS_IPHONE
+// TODO: Add ios func's
+#else
 int main(int argc, char **argv) {
 	extern int optind;
 	int i;
@@ -151,3 +154,4 @@ int main(int argc, char **argv) {
 
 	return fail;
 }
+#endif
