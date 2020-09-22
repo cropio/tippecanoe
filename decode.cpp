@@ -465,6 +465,9 @@ void decode(char *fname, int z, unsigned x, unsigned y) {
 	}
 }
 
+#ifdef TARGET_OS_IPHONE
+// TODO: Add ios func's
+#else
 void usage(char **argv) {
 	fprintf(stderr, "Usage: %s [-t projection] file.mbtiles zoom x y\n", argv[0]);
 	exit(EXIT_FAILURE);
@@ -496,3 +499,4 @@ int main(int argc, char **argv) {
 
 	return 0;
 }
+#endif

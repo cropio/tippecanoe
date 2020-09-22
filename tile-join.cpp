@@ -20,7 +20,7 @@
 std::string dequote(std::string s);
 
 bool pk = false;
-size_t CPUS;
+size_t tile_join_CPUS;
 
 struct stats {
 	int minzoom;
@@ -381,10 +381,10 @@ void *join_worker(void *v) {
 }
 
 void handle_tasks(std::map<zxy, std::vector<std::string>> &tasks, std::vector<std::map<std::string, layermap_entry>> &layermaps, sqlite3 *outdb, std::vector<std::string> &header, std::map<std::string, std::vector<std::string>> &mapping, std::set<std::string> &exclude, int ifmatched) {
-	pthread_t pthreads[CPUS];
+	pthread_t pthreads[tile_join_CPUS];
 	std::vector<arg> args;
 
-	for (size_t i = 0; i < CPUS; i++) {
+	for (size_t i = 0; i < tile_join_CPUS; i++) {
 		args.push_back(arg());
 
 		args[i].layermap = &layermaps[i];
@@ -400,21 +400,21 @@ void handle_tasks(std::map<zxy, std::vector<std::string>> &tasks, std::vector<st
 	// the proper allocation than is saved by perfectly balanced threads.
 	for (auto ai = tasks.begin(); ai != tasks.end(); ++ai) {
 		args[count].inputs.insert(*ai);
-		count = (count + 1) % CPUS;
+		count = (count + 1) % tile_join_CPUS;
 
 		if (ai == tasks.begin()) {
 			fprintf(stderr, "%lld/%lld/%lld  \r", ai->first.z, ai->first.x, ai->first.y);
 		}
 	}
 
-	for (size_t i = 0; i < CPUS; i++) {
+	for (size_t i = 0; i < tile_join_CPUS; i++) {
 		if (pthread_create(&pthreads[i], NULL, join_worker, &args[i]) != 0) {
 			perror("pthread_create");
 			exit(EXIT_FAILURE);
 		}
 	}
 
-	for (size_t i = 0; i < CPUS; i++) {
+	for (size_t i = 0; i < tile_join_CPUS; i++) {
 		void *retval;
 
 		if (pthread_join(pthreads[i], &retval) != 0) {
@@ -429,7 +429,7 @@ void handle_tasks(std::map<zxy, std::vector<std::string>> &tasks, std::vector<st
 
 void decode(struct reader *readers, char *map, std::map<std::string, layermap_entry> &layermap, sqlite3 *outdb, struct stats *st, std::vector<std::string> &header, std::map<std::string, std::vector<std::string>> &mapping, std::set<std::string> &exclude, int ifmatched, std::string &attribution) {
 	std::vector<std::map<std::string, layermap_entry>> layermaps;
-	for (size_t i = 0; i < CPUS; i++) {
+	for (size_t i = 0; i < tile_join_CPUS; i++) {
 		layermaps.push_back(std::map<std::string, layermap_entry>());
 	}
 
@@ -448,7 +448,7 @@ void decode(struct reader *readers, char *map, std::map<std::string, layermap_en
 		f->second.push_back(r->data);
 
 		if (readers == NULL || readers->zoom != r->zoom || readers->x != r->x || readers->y != r->y) {
-			if (tasks.size() > 100 * CPUS) {
+			if (tasks.size() > 100 * tile_join_CPUS) {
 				handle_tasks(tasks, layermaps, outdb, header, mapping, exclude, ifmatched);
 				tasks.clear();
 			}
@@ -620,6 +620,9 @@ void readcsv(char *fn, std::vector<std::string> &header, std::map<std::string, s
 	fclose(f);
 }
 
+#ifdef TARGET_OS_IPHONE
+// TODO: Add ios func's
+#else
 int main(int argc, char **argv) {
 	char *outfile = NULL;
 	char *csv = NULL;
@@ -722,3 +725,4 @@ int main(int argc, char **argv) {
 
 	return 0;
 }
+#endif

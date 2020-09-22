@@ -116,7 +116,7 @@ void checkdisk(struct reader *r, int nreader) {
 	}
 };
 
-void init_cpus() {
+void init_cpus(const char *tmpdir) {
 	CPUS = sysconf(_SC_NPROCESSORS_ONLN);
 	if (CPUS < 1) {
 		CPUS = 1;
@@ -140,8 +140,8 @@ void init_cpus() {
 
 	// Don't really want too many temporary files, because the file system
 	// will start to bog down eventually
-	if (MAX_FILES > 2000) {
-		MAX_FILES = 2000;
+	if (MAX_FILES > 256) {
+		MAX_FILES = 256;
 	}
 
 	// MacOS can run out of system file descriptors
@@ -150,7 +150,7 @@ void init_cpus() {
 	long long fds[MAX_FILES];
 	long long i;
 	for (i = 0; i < MAX_FILES; i++) {
-		fds[i] = open("/dev/null", O_RDONLY);
+		fds[i] = open(tmpdir, O_RDONLY);
 		if (fds[i] < 0) {
 			break;
 		}
@@ -1838,12 +1838,19 @@ static bool has_name(struct option *long_options, int *pl) {
 	return false;
 }
 
+#ifdef TARGET_OS_IPHONE
+int tippecanoe_main(int argc, char **argv, const char *tmp, double *persent) {
+#else
 int main(int argc, char **argv) {
+    const char *tmp = "/dev/null";
+    double *persent = NULL;
+#endif
+
 #ifdef MTRACE
 	mtrace();
 #endif
 
-	init_cpus();
+	init_cpus(tmp);
 
 	extern int optind;
 	extern char *optarg;
@@ -1861,7 +1868,13 @@ int main(int argc, char **argv) {
 	double droprate = 2.5;
 	double gamma = 0;
 	int buffer = 5;
-	const char *tmpdir = "/tmp";
+
+    #ifdef TARGET_OS_IPHONE
+    const char *tmpdir = tmp;
+    #else
+    const char *tmpdir = "/tmp";
+    #endif
+
 	const char *attribution = NULL;
 	std::vector<source> sources;
 
@@ -2165,7 +2178,7 @@ int main(int argc, char **argv) {
 		}
 	}
 
-	files_open_at_start = open("/dev/null", O_RDONLY);
+	files_open_at_start = open(tmp, O_RDONLY);
 	close(files_open_at_start);
 
 	if (full_detail <= 0) {
@@ -2229,7 +2242,7 @@ int main(int argc, char **argv) {
 		sources.push_back(src);
 	}
 
-	ret = read_input(sources, name ? name : outdir, layer, maxzoom, minzoom, basezoom, basezoom_marker_width, outdb, &exclude, &include, exclude_all, droprate, buffer, tmpdir, gamma, read_parallel, forcetable, attribution, gamma != 0);
+    ret = read_input(sources, name ? name : outdir, layer, maxzoom, minzoom, basezoom, basezoom_marker_width, outdb, &exclude, &include, exclude_all, droprate, buffer, tmpdir, gamma, read_parallel, forcetable, attribution, gamma != 0);
 
 	mbtiles_close(outdb, argv);
 
@@ -2237,7 +2250,7 @@ int main(int argc, char **argv) {
 	muntrace();
 #endif
 
-	i = open("/dev/null", O_RDONLY);
+	i = open(tmp, O_RDONLY);
 	// i < files_open_at_start is not an error, because reading from a pipe closes stdin
 	if (i > files_open_at_start) {
 		fprintf(stderr, "Internal error: did not close all files: %d\n", i);
