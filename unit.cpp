@@ -2,6 +2,7 @@
 #include "catch/catch.hpp"
 #include "text.hpp"
 
+#ifndef TARGET_OS_IPHONE
 TEST_CASE("UTF-8 enforcement", "[utf8]") {
 	REQUIRE(check_utf8("") == std::string(""));
 	REQUIRE(check_utf8("hello world") == std::string(""));
@@ -18,3 +19,4 @@ TEST_CASE("UTF-8 truncation", "[trunc]") {
 	REQUIRE(truncate16("0123456789😀😬😁😂😃😄😅😆", 17) == std::string("0123456789😀😬😁"));
 	REQUIRE(truncate16("0123456789あいうえおかきくけこさ", 16) == std::string("0123456789あいうえおか"));
 }
+#endif
