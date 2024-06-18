@@ -4,9 +4,20 @@
 #include <ctype.h>
 #include <string.h>
 #include <stdarg.h>
+#include <errno.h>
 #include "jsonpull.h"
+#include "../milo/milo.h"
 
 #define BUFFER 10000
+
+struct string {
+	char *buf;
+	size_t n;
+	size_t nalloc;
+};
+
+static void string_init(struct string *s);
+static void string_free(struct string *s);
 
 json_pull *json_begin(ssize_t (*read)(struct json_pull *, char *buffer, size_t n), void *source) {
 	json_pull *j = malloc(sizeof(json_pull));
@@ -30,6 +41,13 @@ json_pull *json_begin(ssize_t (*read)(struct json_pull *, char *buffer, size_t n
 		perror("Out of memory");
 		exit(EXIT_FAILURE);
 	}
+
+	j->number_buffer = malloc(sizeof(struct string));
+	if (j->number_buffer == NULL) {
+		perror("Out of memory");
+		exit(EXIT_FAILURE);
+	}
+	string_init(j->number_buffer);
 
 	return j;
 }
@@ -86,6 +104,9 @@ json_pull *json_begin_string(const char *s) {
 }
 
 void json_end(json_pull *p) {
+	string_free(p->number_buffer);
+	free(p->number_buffer);
+
 	json_free(p->root);
 	free(p->buffer);
 	free(p);
@@ -101,7 +122,7 @@ static inline int read_wrap(json_pull *j) {
 	return c;
 }
 
-#define SIZE_FOR(i, size) ((size_t)((((i) + 31) & ~31) * size))
+#define SIZE_FOR(i, size) ((size_t) ((((i) + 7) & ~7) * size))
 
 static json_object *fabricate_object(json_pull *jp, json_object *parent, json_type type) {
 	json_object *o = malloc(sizeof(struct json_object));
@@ -111,11 +132,17 @@ static json_object *fabricate_object(json_pull *jp, json_object *parent, json_ty
 	}
 	o->type = type;
 	o->parent = parent;
-	o->array = NULL;
-	o->keys = NULL;
-	o->values = NULL;
-	o->length = 0;
 	o->parser = jp;
+
+	if (type == JSON_ARRAY) {
+		o->value.array.array = NULL;
+		o->value.array.length = 0;
+	} else if (type == JSON_HASH) {
+		o->value.object.keys = NULL;
+		o->value.object.values = NULL;
+		o->value.object.length = 0;
+	}
+
 	return o;
 }
 
@@ -126,19 +153,19 @@ static json_object *add_object(json_pull *j, json_type type) {
 	if (c != NULL) {
 		if (c->type == JSON_ARRAY) {
 			if (c->expect == JSON_ITEM) {
-				if (SIZE_FOR(c->length + 1, sizeof(json_object *)) != SIZE_FOR(c->length, sizeof(json_object *))) {
-					if (SIZE_FOR(c->length + 1, sizeof(json_object *)) < SIZE_FOR(c->length, sizeof(json_object *))) {
+				if (SIZE_FOR(c->value.array.length + 1, sizeof(json_object *)) != SIZE_FOR(c->value.array.length, sizeof(json_object *))) {
+					if (SIZE_FOR(c->value.array.length + 1, sizeof(json_object *)) < SIZE_FOR(c->value.array.length, sizeof(json_object *))) {
 						fprintf(stderr, "Array size overflow\n");
 						exit(EXIT_FAILURE);
 					}
-					c->array = realloc(c->array, SIZE_FOR(c->length + 1, sizeof(json_object *)));
-					if (c->array == NULL) {
+					c->value.array.array = realloc(c->value.array.array, SIZE_FOR(c->value.array.length + 1, sizeof(json_object *)));
+					if (c->value.array.array == NULL) {
 						perror("Out of memory");
 						exit(EXIT_FAILURE);
 					}
 				}
 
-				c->array[c->length++] = o;
+				c->value.array.array[c->value.array.length++] = o;
 				c->expect = JSON_COMMA;
 			} else {
 				j->error = "Expected a comma, not a list item";
@@ -147,7 +174,7 @@ static json_object *add_object(json_pull *j, json_type type) {
 			}
 		} else if (c->type == JSON_HASH) {
 			if (c->expect == JSON_VALUE) {
-				c->values[c->length - 1] = o;
+				c->value.object.values[c->value.object.length - 1] = o;
 				c->expect = JSON_COMMA;
 			} else if (c->expect == JSON_KEY) {
 				if (type != JSON_STRING) {
@@ -156,22 +183,22 @@ static json_object *add_object(json_pull *j, json_type type) {
 					return NULL;
 				}
 
-				if (SIZE_FOR(c->length + 1, sizeof(json_object *)) != SIZE_FOR(c->length, sizeof(json_object *))) {
-					if (SIZE_FOR(c->length + 1, sizeof(json_object *)) < SIZE_FOR(c->length, sizeof(json_object *))) {
+				if (SIZE_FOR(c->value.object.length + 1, sizeof(json_object *)) != SIZE_FOR(c->value.object.length, sizeof(json_object *))) {
+					if (SIZE_FOR(c->value.object.length + 1, sizeof(json_object *)) < SIZE_FOR(c->value.object.length, sizeof(json_object *))) {
 						fprintf(stderr, "Hash size overflow\n");
 						exit(EXIT_FAILURE);
 					}
-					c->keys = realloc(c->keys, SIZE_FOR(c->length + 1, sizeof(json_object *)));
-					c->values = realloc(c->values, SIZE_FOR(c->length + 1, sizeof(json_object *)));
-					if (c->keys == NULL || c->values == NULL) {
+					c->value.object.keys = realloc(c->value.object.keys, SIZE_FOR(c->value.object.length + 1, sizeof(json_object *)));
+					c->value.object.values = realloc(c->value.object.values, SIZE_FOR(c->value.object.length + 1, sizeof(json_object *)));
+					if (c->value.object.keys == NULL || c->value.object.values == NULL) {
 						perror("Out of memory");
 						exit(EXIT_FAILURE);
 					}
 				}
 
-				c->keys[c->length] = o;
-				c->values[c->length] = NULL;
-				c->length++;
+				c->value.object.keys[c->value.object.length] = o;
+				c->value.object.values[c->value.object.length] = NULL;
+				c->value.object.length++;
 				c->expect = JSON_COLON;
 			} else {
 				j->error = "Expected a comma or colon";
@@ -196,22 +223,16 @@ json_object *json_hash_get(json_object *o, const char *s) {
 	}
 
 	size_t i;
-	for (i = 0; i < o->length; i++) {
-		if (o->keys[i] != NULL && o->keys[i]->type == JSON_STRING) {
-			if (strcmp(o->keys[i]->string, s) == 0) {
-				return o->values[i];
+	for (i = 0; i < o->value.object.length; i++) {
+		if (o->value.object.keys[i] != NULL && o->value.object.keys[i]->type == JSON_STRING) {
+			if (strcmp(o->value.object.keys[i]->value.string.string, s) == 0) {
+				return o->value.object.values[i];
 			}
 		}
 	}
 
 	return NULL;
 }
-
-struct string {
-	char *buf;
-	size_t n;
-	size_t nalloc;
-};
 
 static void string_init(struct string *s) {
 	s->nalloc = 500;
@@ -284,38 +305,45 @@ json_object *json_read_separators(json_pull *j, json_separator_callback cb, void
 	}
 
 again:
-	/////////////////////////// Whitespace
-
-	do {
-		c = read_wrap(j);
-		if (c == EOF) {
-			if (j->container != NULL) {
-				j->error = "Reached EOF without all containers being closed";
-			}
-
-			return NULL;
+	c = read_wrap(j);
+	if (c == EOF) {
+		if (j->container != NULL) {
+			j->error = "Reached EOF without all containers being closed";
 		}
 
-		// Byte-order mark
-		if (c == 0xEF) {
-			int c2 = peek(j);
-			if (c2 == 0xBB) {
+		return NULL;
+	}
+
+	switch (c) {
+		/////////////////////////// Byte order mark
+
+	case 0xEF: {
+		int c2 = peek(j);
+		if (c2 == 0xBB) {
+			c2 = read_wrap(j);
+			c2 = peek(j);
+			if (c2 == 0xBF) {
 				c2 = read_wrap(j);
-				c2 = peek(j);
-				if (c2 == 0xBF) {
-					c2 = read_wrap(j);
-					c = ' ';
-					continue;
-				}
+				c = ' ';
+				goto again;
 			}
-			j->error = "Corrupt byte-order mark found";
-			return NULL;
 		}
-	} while (c == ' ' || c == '\t' || c == '\r' || c == '\n' || c == 0x1E);
+		j->error = "Corrupt byte-order mark found";
+		return NULL;
+	}
 
-	/////////////////////////// Arrays
+		/////////////////////////// Whitespace
 
-	if (c == '[') {
+	case ' ':
+	case '\t':
+	case '\r':
+	case '\n':
+	case 0x1E:
+		goto again;
+
+		/////////////////////////// Arrays
+
+	case '[': {
 		json_object *o = add_object(j, JSON_ARRAY);
 		if (o == NULL) {
 			return NULL;
@@ -328,7 +356,9 @@ again:
 		}
 
 		goto again;
-	} else if (c == ']') {
+	}
+
+	case ']': {
 		if (j->container == NULL) {
 			j->error = "Found ] at top level";
 			return NULL;
@@ -340,7 +370,7 @@ again:
 		}
 
 		if (j->container->expect != JSON_COMMA) {
-			if (!(j->container->expect == JSON_ITEM && j->container->length == 0)) {
+			if (!(j->container->expect == JSON_ITEM && j->container->value.array.length == 0)) {
 				j->error = "Found ] without final element";
 				return NULL;
 			}
@@ -351,9 +381,9 @@ again:
 		return ret;
 	}
 
-	/////////////////////////// Hashes
+		/////////////////////////// Hashes
 
-	if (c == '{') {
+	case '{': {
 		json_object *o = add_object(j, JSON_HASH);
 		if (o == NULL) {
 			return NULL;
@@ -366,7 +396,9 @@ again:
 		}
 
 		goto again;
-	} else if (c == '}') {
+	}
+
+	case '}': {
 		if (j->container == NULL) {
 			j->error = "Found } at top level";
 			return NULL;
@@ -378,7 +410,7 @@ again:
 		}
 
 		if (j->container->expect != JSON_COMMA) {
-			if (!(j->container->expect == JSON_KEY && j->container->length == 0)) {
+			if (!(j->container->expect == JSON_KEY && j->container->value.object.length == 0)) {
 				j->error = "Found } without final element";
 				return NULL;
 			}
@@ -389,9 +421,9 @@ again:
 		return ret;
 	}
 
-	/////////////////////////// Null
+		/////////////////////////// Null
 
-	if (c == 'n') {
+	case 'n': {
 		if (read_wrap(j) != 'u' || read_wrap(j) != 'l' || read_wrap(j) != 'l') {
 			j->error = "Found misspelling of null";
 			return NULL;
@@ -400,9 +432,9 @@ again:
 		return add_object(j, JSON_NULL);
 	}
 
-	/////////////////////////// NaN
+		/////////////////////////// NaN
 
-	if (c == 'N') {
+	case 'N': {
 		if (read_wrap(j) != 'a' || read_wrap(j) != 'N') {
 			j->error = "Found misspelling of NaN";
 			return NULL;
@@ -412,9 +444,9 @@ again:
 		return NULL;
 	}
 
-	/////////////////////////// Infinity
+		/////////////////////////// Infinity
 
-	if (c == 'I') {
+	case 'I': {
 		if (read_wrap(j) != 'n' || read_wrap(j) != 'f' || read_wrap(j) != 'i' ||
 		    read_wrap(j) != 'n' || read_wrap(j) != 'i' || read_wrap(j) != 't' ||
 		    read_wrap(j) != 'y') {
@@ -426,9 +458,9 @@ again:
 		return NULL;
 	}
 
-	/////////////////////////// True
+		/////////////////////////// True
 
-	if (c == 't') {
+	case 't': {
 		if (read_wrap(j) != 'r' || read_wrap(j) != 'u' || read_wrap(j) != 'e') {
 			j->error = "Found misspelling of true";
 			return NULL;
@@ -437,9 +469,9 @@ again:
 		return add_object(j, JSON_TRUE);
 	}
 
-	/////////////////////////// False
+		/////////////////////////// False
 
-	if (c == 'f') {
+	case 'f': {
 		if (read_wrap(j) != 'a' || read_wrap(j) != 'l' || read_wrap(j) != 's' || read_wrap(j) != 'e') {
 			j->error = "Found misspelling of false";
 			return NULL;
@@ -448,9 +480,9 @@ again:
 		return add_object(j, JSON_FALSE);
 	}
 
-	/////////////////////////// Comma
+		/////////////////////////// Comma
 
-	if (c == ',') {
+	case ',': {
 		if (j->container != NULL) {
 			if (j->container->expect != JSON_COMMA) {
 				j->error = "Found unexpected comma";
@@ -471,9 +503,9 @@ again:
 		goto again;
 	}
 
-	/////////////////////////// Colon
+		/////////////////////////// Colon
 
-	if (c == ':') {
+	case ':': {
 		if (j->container == NULL) {
 			j->error = "Found colon at top level";
 			return NULL;
@@ -493,79 +525,109 @@ again:
 		goto again;
 	}
 
-	/////////////////////////// Numbers
+		/////////////////////////// Numbers
 
-	if (c == '-' || (c >= '0' && c <= '9')) {
-		struct string val;
-		string_init(&val);
+	case '-':
+	case '0':
+	case '1':
+	case '2':
+	case '3':
+	case '4':
+	case '5':
+	case '6':
+	case '7':
+	case '8':
+	case '9': {
+		j->number_buffer->n = 0;
+		int decimal = 0;
 
 		if (c == '-') {
-			string_append(&val, c);
+			string_append(j->number_buffer, c);
 			c = read_wrap(j);
 		}
 
 		if (c == '0') {
-			string_append(&val, c);
+			string_append(j->number_buffer, c);
 		} else if (c >= '1' && c <= '9') {
-			string_append(&val, c);
+			string_append(j->number_buffer, c);
 			c = peek(j);
 
 			while (c >= '0' && c <= '9') {
-				string_append(&val, read_wrap(j));
+				string_append(j->number_buffer, read_wrap(j));
 				c = peek(j);
 			}
 		}
 
 		if (peek(j) == '.') {
-			string_append(&val, read_wrap(j));
+			string_append(j->number_buffer, read_wrap(j));
+			decimal = 1;
 
 			c = peek(j);
 			if (c < '0' || c > '9') {
 				j->error = "Decimal point without digits";
-				string_free(&val);
+				string_free(j->number_buffer);
 				return NULL;
 			}
 			while (c >= '0' && c <= '9') {
-				string_append(&val, read_wrap(j));
+				string_append(j->number_buffer, read_wrap(j));
 				c = peek(j);
 			}
 		}
 
 		c = peek(j);
 		if (c == 'e' || c == 'E') {
-			string_append(&val, read_wrap(j));
+			string_append(j->number_buffer, read_wrap(j));
+			decimal = 1;
 
 			c = peek(j);
 			if (c == '+' || c == '-') {
-				string_append(&val, read_wrap(j));
+				string_append(j->number_buffer, read_wrap(j));
 			}
 
 			c = peek(j);
 			if (c < '0' || c > '9') {
 				j->error = "Exponent without digits";
-				string_free(&val);
+				string_free(j->number_buffer);
 				return NULL;
 			}
 			while (c >= '0' && c <= '9') {
-				string_append(&val, read_wrap(j));
+				string_append(j->number_buffer, read_wrap(j));
 				c = peek(j);
 			}
 		}
 
 		json_object *n = add_object(j, JSON_NUMBER);
 		if (n != NULL) {
-			n->number = atof(val.buf);
-			n->string = val.buf;
-			n->length = val.n;
-		} else {
-			string_free(&val);
+			n->value.number.number = atof(j->number_buffer->buf);
+			n->value.number.large_signed = 0;
+			n->value.number.large_unsigned = 0;
+
+#define MAX_SAFE_INTEGER 9007199254740991.0
+#define MIN_SAFE_INTEGER -9007199254740991.0
+
+			if (!decimal && n->value.number.number > MAX_SAFE_INTEGER) {
+				errno = 0;
+				char *err = NULL;
+				unsigned long long ull = strtoull(j->number_buffer->buf, &err, 10);
+				if (errno == 0 && (err == NULL || *err == '\0')) {
+					n->value.number.large_unsigned = ull;
+				}
+			}
+			if (!decimal && n->value.number.number < MIN_SAFE_INTEGER) {
+				errno = 0;
+				char *err = NULL;
+				long long ll = strtoll(j->number_buffer->buf, &err, 10);
+				if (errno == 0 && (err == NULL || *err == '\0')) {
+					n->value.number.large_signed = ll;
+				}
+			}
 		}
 		return n;
 	}
 
-	/////////////////////////// Strings
+		/////////////////////////// Strings
 
-	if (c == '"') {
+	case '"': {
 		struct string val;
 		string_init(&val);
 
@@ -692,12 +754,13 @@ again:
 
 		json_object *s = add_object(j, JSON_STRING);
 		if (s != NULL) {
-			s->string = val.buf;
-			s->length = val.n;
+			s->value.string.string = val.buf;
+			s->value.string.refcon = NULL;
 		} else {
 			string_free(&val);
 		}
 		return s;
+	}
 	}
 
 	j->error = "Found unexpected character";
@@ -730,11 +793,11 @@ void json_free(json_object *o) {
 	// Free any data linked from here
 
 	if (o->type == JSON_ARRAY) {
-		json_object **a = o->array;
-		size_t n = o->length;
+		json_object **a = o->value.array.array;
+		size_t n = o->value.array.length;
 
-		o->array = NULL;
-		o->length = 0;
+		o->value.array.array = NULL;
+		o->value.array.length = 0;
 
 		for (i = 0; i < n; i++) {
 			json_free(a[i]);
@@ -742,13 +805,13 @@ void json_free(json_object *o) {
 
 		free(a);
 	} else if (o->type == JSON_HASH) {
-		json_object **k = o->keys;
-		json_object **v = o->values;
-		size_t n = o->length;
+		json_object **k = o->value.object.keys;
+		json_object **v = o->value.object.values;
+		size_t n = o->value.object.length;
 
-		o->keys = NULL;
-		o->values = NULL;
-		o->length = 0;
+		o->value.object.keys = NULL;
+		o->value.object.values = NULL;
+		o->value.object.length = 0;
 
 		for (i = 0; i < n; i++) {
 			json_free(k[i]);
@@ -757,8 +820,10 @@ void json_free(json_object *o) {
 
 		free(k);
 		free(v);
-	} else if (o->type == JSON_STRING || o->type == JSON_NUMBER) {
-		free(o->string);
+	} else if (o->type == JSON_STRING) {
+		free(o->value.string.string);
+	} else if (o->type == JSON_NUMBER) {
+		;
 	}
 
 	json_disconnect(o);
@@ -769,14 +834,14 @@ void json_free(json_object *o) {
 static void json_disconnect_parser(json_object *o) {
 	if (o->type == JSON_HASH) {
 		size_t i;
-		for (i = 0; i < o->length; i++) {
-			json_disconnect_parser(o->keys[i]);
-			json_disconnect_parser(o->values[i]);
+		for (i = 0; i < o->value.object.length; i++) {
+			json_disconnect_parser(o->value.object.keys[i]);
+			json_disconnect_parser(o->value.object.values[i]);
 		}
 	} else if (o->type == JSON_ARRAY) {
 		size_t i;
-		for (i = 0; i < o->length; i++) {
-			json_disconnect_parser(o->array[i]);
+		for (i = 0; i < o->value.array.length; i++) {
+			json_disconnect_parser(o->value.array.array[i]);
 		}
 	}
 
@@ -791,41 +856,41 @@ void json_disconnect(json_object *o) {
 		if (o->parent->type == JSON_ARRAY) {
 			size_t i;
 
-			for (i = 0; i < o->parent->length; i++) {
-				if (o->parent->array[i] == o) {
+			for (i = 0; i < o->parent->value.array.length; i++) {
+				if (o->parent->value.array.array[i] == o) {
 					break;
 				}
 			}
 
-			if (i < o->parent->length) {
-				memmove(o->parent->array + i, o->parent->array + i + 1, o->parent->length - i - 1);
-				o->parent->length--;
+			if (i < o->parent->value.array.length) {
+				memmove(o->parent->value.array.array + i, o->parent->value.array.array + i + 1, o->parent->value.array.length - i - 1);
+				o->parent->value.array.length--;
 			}
 		}
 
 		if (o->parent->type == JSON_HASH) {
 			size_t i;
 
-			for (i = 0; i < o->parent->length; i++) {
-				if (o->parent->keys[i] == o) {
-					o->parent->keys[i] = fabricate_object(o->parser, o->parent, JSON_NULL);
+			for (i = 0; i < o->parent->value.object.length; i++) {
+				if (o->parent->value.object.keys[i] == o) {
+					o->parent->value.object.keys[i] = fabricate_object(o->parser, o->parent, JSON_NULL);
 					break;
 				}
-				if (o->parent->values[i] == o) {
-					o->parent->values[i] = fabricate_object(o->parser, o->parent, JSON_NULL);
+				if (o->parent->value.object.values[i] == o) {
+					o->parent->value.object.values[i] = fabricate_object(o->parser, o->parent, JSON_NULL);
 					break;
 				}
 			}
 
-			if (i < o->parent->length) {
-				if (o->parent->keys[i] != NULL && o->parent->keys[i]->type == JSON_NULL) {
-					if (o->parent->values[i] != NULL && o->parent->values[i]->type == JSON_NULL) {
-						free(o->parent->keys[i]);
-						free(o->parent->values[i]);
+			if (i < o->parent->value.object.length) {
+				if (o->parent->value.object.keys[i] != NULL && o->parent->value.object.keys[i]->type == JSON_NULL) {
+					if (o->parent->value.object.values[i] != NULL && o->parent->value.object.values[i]->type == JSON_NULL) {
+						free(o->parent->value.object.keys[i]);
+						free(o->parent->value.object.values[i]);
 
-						memmove(o->parent->keys + i, o->parent->keys + i + 1, o->parent->length - i - 1);
-						memmove(o->parent->values + i, o->parent->values + i + 1, o->parent->length - i - 1);
-						o->parent->length--;
+						memmove(o->parent->value.object.keys + i, o->parent->value.object.keys + i + 1, o->parent->value.object.length - i - 1);
+						memmove(o->parent->value.object.values + i, o->parent->value.object.values + i + 1, o->parent->value.object.length - i - 1);
+						o->parent->value.object.length--;
 					}
 				}
 			}
@@ -847,7 +912,7 @@ static void json_print_one(struct string *val, json_object *o) {
 		string_append(val, '\"');
 
 		char *cp;
-		for (cp = o->string; *cp != '\0'; cp++) {
+		for (cp = o->value.string.string; *cp != '\0'; cp++) {
 			if (*cp == '\\' || *cp == '"') {
 				string_append(val, '\\');
 				string_append(val, *cp);
@@ -864,7 +929,19 @@ static void json_print_one(struct string *val, json_object *o) {
 
 		string_append(val, '\"');
 	} else if (o->type == JSON_NUMBER) {
-		string_append_string(val, o->string);
+		if (o->value.number.large_signed != 0) {
+			char s[65];
+			sprintf(s, "%lld", o->value.number.large_signed);
+			string_append_string(val, s);
+		} else if (o->value.number.large_unsigned != 0) {
+			char s[65];
+			sprintf(s, "%llu", o->value.number.large_unsigned);
+			string_append_string(val, s);
+		} else {
+			char *s = dtoa_milo(o->value.number.number);
+			string_append_string(val, s);
+			free(s);
+		}
 	} else if (o->type == JSON_NULL) {
 		string_append_string(val, "null");
 	} else if (o->type == JSON_TRUE) {
@@ -886,11 +963,11 @@ static void json_print(struct string *val, json_object *o) {
 		string_append(val, '{');
 
 		size_t i;
-		for (i = 0; i < o->length; i++) {
-			json_print(val, o->keys[i]);
+		for (i = 0; i < o->value.object.length; i++) {
+			json_print(val, o->value.object.keys[i]);
 			string_append(val, ':');
-			json_print(val, o->values[i]);
-			if (i + 1 < o->length) {
+			json_print(val, o->value.object.values[i]);
+			if (i + 1 < o->value.object.length) {
 				string_append(val, ',');
 			}
 		}
@@ -898,9 +975,9 @@ static void json_print(struct string *val, json_object *o) {
 	} else if (o->type == JSON_ARRAY) {
 		string_append(val, '[');
 		size_t i;
-		for (i = 0; i < o->length; i++) {
-			json_print(val, o->array[i]);
-			if (i + 1 < o->length) {
+		for (i = 0; i < o->value.array.length; i++) {
+			json_print(val, o->value.array.array[i]);
+			if (i + 1 < o->value.array.length) {
 				string_append(val, ',');
 			}
 		}

@@ -14,6 +14,8 @@
 #include "milo/dtoa_milo.h"
 #include "jsonpull/jsonpull.h"
 #include "text.hpp"
+#include "errors.hpp"
+#include "thread.hpp"
 
 #define POINT 0
 #define MULTIPOINT 1
@@ -37,7 +39,7 @@ static std::vector<queued_feature> feature_queue;
 void ensureDim(size_t dim) {
 	if (dim < 2) {
 		fprintf(stderr, "Geometry has fewer than 2 dimensions: %zu\n", dim);
-		exit(EXIT_FAILURE);
+		exit(EXIT_IMPOSSIBLE);
 	}
 }
 
@@ -117,7 +119,7 @@ drawvec readLinePart(std::vector<long long> &coords, size_t dim, double e, size_
 	for (size_t i = start; i + dim - 1 < end; i += dim) {
 		if (i + dim - 1 >= coords.size()) {
 			fprintf(stderr, "Internal error: line segment %zu vs %zu\n", i + dim - 1, coords.size());
-			exit(EXIT_FAILURE);
+			exit(EXIT_IMPOSSIBLE);
 		}
 
 		for (size_t d = 0; d < dim; d++) {
@@ -190,7 +192,7 @@ drawvec readMultiPolygon(std::vector<long long> &coords, std::vector<int> &lengt
 			}
 		}
 
-		dv.push_back(draw(VT_CLOSEPATH, 0, 0));  // mark that the next ring is outer
+		dv.push_back(draw(VT_CLOSEPATH, 0, 0));	 // mark that the next ring is outer
 	}
 
 	return dv;
@@ -328,12 +330,12 @@ void readFeature(protozero::pbf_reader &pbf, size_t dim, double e, std::vector<s
 			for (size_t i = 0; i + 1 < properties.size(); i += 2) {
 				if (properties[i] >= keys.size()) {
 					fprintf(stderr, "Out of bounds key: %zu in %zu\n", properties[i], keys.size());
-					exit(EXIT_FAILURE);
+					exit(EXIT_IMPOSSIBLE);
 				}
 
 				if (properties[i + 1] >= values.size()) {
 					fprintf(stderr, "Out of bounds value: %zu in %zu\n", properties[i + 1], values.size());
-					exit(EXIT_FAILURE);
+					exit(EXIT_IMPOSSIBLE);
 				}
 
 				full_keys.push_back(keys[properties[i]]);
@@ -354,12 +356,12 @@ void readFeature(protozero::pbf_reader &pbf, size_t dim, double e, std::vector<s
 			for (size_t i = 0; i + 1 < misc.size(); i += 2) {
 				if (misc[i] >= keys.size()) {
 					fprintf(stderr, "Out of bounds key: %zu in %zu\n", misc[i], keys.size());
-					exit(EXIT_FAILURE);
+					exit(EXIT_IMPOSSIBLE);
 				}
 
 				if (misc[i + 1] >= values.size()) {
 					fprintf(stderr, "Out of bounds value: %zu in %zu\n", misc[i + 1], values.size());
-					exit(EXIT_FAILURE);
+					exit(EXIT_IMPOSSIBLE);
 				}
 
 				other.insert(std::pair<std::string, serial_val>(keys[misc[i]], values[misc[i + 1]]));
@@ -378,12 +380,11 @@ void readFeature(protozero::pbf_reader &pbf, size_t dim, double e, std::vector<s
 		serial_feature sf;
 
 		sf.layer = layer;
-		sf.layername = layername;
 		sf.segment = sst->segment;
 		sf.has_id = has_id;
 		sf.id = id;
-		sf.has_tippecanoe_minzoom = false;
-		sf.has_tippecanoe_maxzoom = false;
+		sf.tippecanoe_minzoom = -1;
+		sf.tippecanoe_maxzoom = -1;
 		sf.feature_minzoom = false;
 		sf.seq = *(sst->layer_seq);
 		sf.geometry = dv[i].dv;
@@ -398,20 +399,18 @@ void readFeature(protozero::pbf_reader &pbf, size_t dim, double e, std::vector<s
 
 			if (o != NULL) {
 				json_object *min = json_hash_get(o, "minzoom");
-				if (min != NULL && (min->type == JSON_STRING || min->type == JSON_NUMBER)) {
-					sf.has_tippecanoe_minzoom = true;
-					sf.tippecanoe_minzoom = integer_zoom(sst->fname, min->string);
+				if (min != NULL && (min->type == JSON_NUMBER)) {
+					sf.tippecanoe_minzoom = integer_zoom(sst->fname, milo::dtoa_milo(min->value.number.number));
 				}
 
 				json_object *max = json_hash_get(o, "maxzoom");
-				if (max != NULL && (max->type == JSON_STRING || max->type == JSON_NUMBER)) {
-					sf.has_tippecanoe_maxzoom = true;
-					sf.tippecanoe_maxzoom = integer_zoom(sst->fname, max->string);
+				if (max != NULL && (max->type == JSON_NUMBER)) {
+					sf.tippecanoe_maxzoom = integer_zoom(sst->fname, milo::dtoa_milo(max->value.number.number));
 				}
 
 				json_object *tlayer = json_hash_get(o, "layer");
-				if (tlayer != NULL && (tlayer->type == JSON_STRING || tlayer->type == JSON_NUMBER)) {
-					sf.layername = tlayer->string;
+				if (tlayer != NULL && (tlayer->type == JSON_STRING)) {
+					layername = tlayer->value.string.string;
 				}
 			}
 
@@ -419,7 +418,7 @@ void readFeature(protozero::pbf_reader &pbf, size_t dim, double e, std::vector<s
 			json_end(jp);
 		}
 
-		serialize_feature(sst, sf);
+		serialize_feature(sst, sf, layername);
 	}
 }
 
@@ -464,9 +463,9 @@ void runQueue() {
 	}
 
 	for (size_t i = 0; i < CPUS; i++) {
-		if (pthread_create(&pthreads[i], NULL, run_parse_feature, &qra[i]) != 0) {
+		if (thread_create(&pthreads[i], NULL, run_parse_feature, &qra[i]) != 0) {
 			perror("pthread_create");
-			exit(EXIT_FAILURE);
+			exit(EXIT_PTHREAD);
 		}
 	}
 
@@ -505,17 +504,16 @@ void outBareGeometry(drawvec const &dv, int type, struct serialization_state *ss
 	serial_feature sf;
 
 	sf.layer = layer;
-	sf.layername = layername;
 	sf.segment = sst->segment;
 	sf.has_id = false;
-	sf.has_tippecanoe_minzoom = false;
-	sf.has_tippecanoe_maxzoom = false;
+	sf.tippecanoe_minzoom = -1;
+	sf.tippecanoe_maxzoom = -1;
 	sf.feature_minzoom = false;
 	sf.seq = (*sst->layer_seq);
 	sf.geometry = dv;
 	sf.t = type;
 
-	serialize_feature(sst, sf);
+	serialize_feature(sst, sf, layername);
 }
 
 void readFeatureCollection(protozero::pbf_reader &pbf, size_t dim, double e, std::vector<std::string> &keys, std::vector<struct serialization_state> *sst, int layer, std::string layername) {

@@ -16,7 +16,12 @@
 // XXX duplicated
 #define GEOM_TYPES 6
 static const char *geometry_names[GEOM_TYPES] = {
-	"Point", "MultiPoint", "LineString", "MultiLineString", "Polygon", "MultiPolygon",
+	"Point",
+	"MultiPoint",
+	"LineString",
+	"MultiLineString",
+	"Polygon",
+	"MultiPolygon",
 };
 
 // XXX duplicated
@@ -24,10 +29,10 @@ static void json_context(json_object *j) {
 	char *s = json_stringify(j);
 
 	if (strlen(s) >= 500) {
-		sprintf(s + 497, "...");
+		snprintf(s + 497, strlen(s) + 1 - 497, "...");
 	}
 
-	fprintf(stderr, "In JSON object %s\n", s);
+	fprintf(stderr, "in JSON object %s\n", s);
 	free(s);  // stringify
 }
 
@@ -40,9 +45,11 @@ void parse_json(json_feature_action *jfa, json_pull *jp) {
 		json_object *j = json_read(jp);
 		if (j == NULL) {
 			if (jp->error != NULL) {
-				fprintf(stderr, "%s:%d: %s\n", jfa->fname.c_str(), jp->line, jp->error);
+				fprintf(stderr, "%s:%d: %s: ", jfa->fname.c_str(), jp->line, jp->error);
 				if (jp->root != NULL) {
 					json_context(jp->root);
+				} else {
+					fprintf(stderr, "\n");
 				}
 			}
 
@@ -67,7 +74,7 @@ void parse_json(json_feature_action *jfa, json_pull *jp) {
 			int i;
 			int is_geometry = 0;
 			for (i = 0; i < GEOM_TYPES; i++) {
-				if (strcmp(type->string, geometry_names[i]) == 0) {
+				if (strcmp(type->value.string.string, geometry_names[i]) == 0) {
 					is_geometry = 1;
 					break;
 				}
@@ -119,8 +126,8 @@ void parse_json(json_feature_action *jfa, json_pull *jp) {
 			}
 		}
 
-		if (strcmp(type->string, "Feature") != 0) {
-			if (strcmp(type->string, "FeatureCollection") == 0) {
+		if (strcmp(type->value.string.string, "Feature") != 0) {
+			if (strcmp(type->value.string.string, "FeatureCollection") == 0) {
 				jfa->check_crs(j);
 				json_free(j);
 			}
@@ -135,7 +142,7 @@ void parse_json(json_feature_action *jfa, json_pull *jp) {
 
 		json_object *geometry = json_hash_get(j, "geometry");
 		if (geometry == NULL) {
-			fprintf(stderr, "%s:%d: feature with no geometry\n", jfa->fname.c_str(), jp->line);
+			fprintf(stderr, "%s:%d: feature with no geometry: ", jfa->fname.c_str(), jp->line);
 			json_context(j);
 			json_free(j);
 			continue;
@@ -143,7 +150,7 @@ void parse_json(json_feature_action *jfa, json_pull *jp) {
 
 		json_object *properties = json_hash_get(j, "properties");
 		if (properties == NULL || (properties->type != JSON_HASH && properties->type != JSON_NULL)) {
-			fprintf(stderr, "%s:%d: feature without properties hash\n", jfa->fname.c_str(), jp->line);
+			fprintf(stderr, "%s:%d: feature without properties hash: ", jfa->fname.c_str(), jp->line);
 			json_context(j);
 			json_free(j);
 			continue;

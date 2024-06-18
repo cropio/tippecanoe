@@ -14,6 +14,8 @@
 #include "mvt.hpp"
 #include "write_json.hpp"
 #include "milo/dtoa_milo.h"
+#include "errors.hpp"
+#include "serial.hpp"
 
 void json_writer::json_adjust() {
 	if (state.size() == 0) {
@@ -28,7 +30,11 @@ void json_writer::json_adjust() {
 		nospace = false;
 		state[state.size() - 1] = JSON_WRITE_HASH_KEY;
 	} else if (state[state.size() - 1] == JSON_WRITE_HASH_KEY) {
-		adds(": ");
+		adds(":");
+		if (!nospace) {
+			addc(' ');
+			nospace = false;
+		}
 		state[state.size() - 1] = JSON_WRITE_HASH_VALUE;
 	} else if (state[state.size() - 1] == JSON_WRITE_HASH_VALUE) {
 		if (wantnl) {
@@ -62,7 +68,7 @@ void json_writer::json_adjust() {
 		state[state.size() - 1] = JSON_WRITE_ARRAY_ELEMENT;
 	} else {
 		fprintf(stderr, "Impossible JSON state\n");
-		exit(EXIT_FAILURE);
+		exit(EXIT_JSON);
 	}
 }
 
@@ -76,7 +82,7 @@ void json_writer::json_write_array() {
 void json_writer::json_end_array() {
 	if (state.size() == 0) {
 		fprintf(stderr, "End JSON array at top level\n");
-		exit(EXIT_FAILURE);
+		exit(EXIT_JSON);
 	}
 
 	json_write_tok tok = state[state.size() - 1];
@@ -90,7 +96,7 @@ void json_writer::json_end_array() {
 		addc(']');
 	} else {
 		fprintf(stderr, "End JSON array with unexpected state\n");
-		exit(EXIT_FAILURE);
+		exit(EXIT_JSON);
 	}
 }
 
@@ -104,7 +110,7 @@ void json_writer::json_write_hash() {
 void json_writer::json_end_hash() {
 	if (state.size() == 0) {
 		fprintf(stderr, "End JSON hash at top level\n");
-		exit(EXIT_FAILURE);
+		exit(EXIT_JSON);
 	}
 
 	json_write_tok tok = state[state.size() - 1];
@@ -124,7 +130,7 @@ void json_writer::json_end_hash() {
 		addc('}');
 	} else {
 		fprintf(stderr, "End JSON hash with unexpected state\n");
-		exit(EXIT_FAILURE);
+		exit(EXIT_JSON);
 	}
 }
 
@@ -142,6 +148,11 @@ void json_writer::json_write_string(std::string const &str) {
 		}
 	}
 	addc('"');
+}
+
+void json_writer::json_write_json(std::string const &str) {
+	json_adjust();
+	adds(str);
 }
 
 void json_writer::json_write_number(double d) {
@@ -207,7 +218,7 @@ void json_writer::aprintf(const char *format, ...) {
 	va_start(ap, format);
 	if (vasprintf(&tmp, format, ap) < 0) {
 		fprintf(stderr, "memory allocation failure\n");
-		exit(EXIT_FAILURE);
+		exit(EXIT_MEMORY);
 	}
 	va_end(ap);
 
@@ -247,7 +258,17 @@ struct lonlat {
 	}
 };
 
-void layer_to_geojson(mvt_layer const &layer, unsigned z, unsigned x, unsigned y, bool comma, bool name, bool zoom, bool dropped, unsigned long long index, long long sequence, long long extent, bool complain, json_writer &state) {
+void write_coords(json_writer &state, lonlat const &ll, double scale) {
+	if (scale == 0) {
+		state.json_write_float(ll.lon);
+		state.json_write_float(ll.lat);
+	} else {
+		state.json_write_number(ll.x / scale);
+		state.json_write_number(ll.y / scale);
+	}
+}
+
+void layer_to_geojson(mvt_layer const &layer, unsigned z, unsigned x, unsigned y, bool comma, bool name, bool zoom, bool write_dropped, unsigned long long index, long long sequence, long long extent, bool complain, json_writer &state, double scale) {
 	for (size_t f = 0; f < layer.features.size(); f++) {
 		mvt_feature const &feat = layer.features[f];
 
@@ -277,9 +298,9 @@ void layer_to_geojson(mvt_layer const &layer, unsigned z, unsigned x, unsigned y
 				state.json_write_unsigned(z);
 			}
 
-			if (dropped) {
+			if (write_dropped) {
 				state.json_write_string("dropped");
-				state.json_write_bool(feat.dropped);
+				state.json_write_bool(feat.dropped == FEATURE_DROPPED);
 			}
 
 			if (index != 0) {
@@ -306,43 +327,52 @@ void layer_to_geojson(mvt_layer const &layer, unsigned z, unsigned x, unsigned y
 		for (size_t t = 0; t + 1 < feat.tags.size(); t += 2) {
 			if (feat.tags[t] >= layer.keys.size()) {
 				fprintf(stderr, "Error: out of bounds feature key (%u in %zu)\n", feat.tags[t], layer.keys.size());
-				exit(EXIT_FAILURE);
+				exit(EXIT_IMPOSSIBLE);
 			}
 			if (feat.tags[t + 1] >= layer.values.size()) {
 				fprintf(stderr, "Error: out of bounds feature value (%u in %zu)\n", feat.tags[t + 1], layer.values.size());
-				exit(EXIT_FAILURE);
+				exit(EXIT_IMPOSSIBLE);
 			}
 
 			const char *key = layer.keys[feat.tags[t]].c_str();
 			mvt_value const &val = layer.values[feat.tags[t + 1]];
 
-			if (val.type == mvt_string) {
+			switch (val.type) {
+			case mvt_string:
 				state.json_write_string(key);
-				state.json_write_string(val.string_value);
-			} else if (val.type == mvt_int) {
+				state.json_write_string(val.get_string_value());
+				break;
+			case mvt_int:
 				state.json_write_string(key);
 				state.json_write_signed(val.numeric_value.int_value);
-			} else if (val.type == mvt_double) {
+				break;
+			case mvt_double:
 				state.json_write_string(key);
 				state.json_write_number(val.numeric_value.double_value);
-			} else if (val.type == mvt_float) {
+				break;
+			case mvt_float:
 				state.json_write_string(key);
 				state.json_write_number(val.numeric_value.float_value);
-			} else if (val.type == mvt_sint) {
+				break;
+			case mvt_sint:
 				state.json_write_string(key);
 				state.json_write_signed(val.numeric_value.sint_value);
-			} else if (val.type == mvt_uint) {
+				break;
+			case mvt_uint:
 				state.json_write_string(key);
 				state.json_write_unsigned(val.numeric_value.uint_value);
-			} else if (val.type == mvt_bool) {
+				break;
+			case mvt_bool:
 				state.json_write_string(key);
 				state.json_write_bool(val.numeric_value.bool_value);
-			} else if (val.type == mvt_null) {
+				break;
+			case mvt_null:
 				state.json_write_string(key);
 				state.json_write_null();
-			} else {
+				break;
+			default:
 				fprintf(stderr, "Internal error: property with unknown type\n");
-				exit(EXIT_FAILURE);
+				exit(EXIT_IMPOSSIBLE);
 			}
 		}
 
@@ -359,9 +389,9 @@ void layer_to_geojson(mvt_layer const &layer, unsigned z, unsigned x, unsigned y
 			long long py = feat.geometry[g].y;
 
 			if (op == VT_MOVETO || op == VT_LINETO) {
-				long long scale = 1LL << (32 - z);
-				long long wx = scale * x + (scale / layer.extent) * px;
-				long long wy = scale * y + (scale / layer.extent) * py;
+				long long wscale = 1LL << (32 - z);
+				long long wx = wscale * x + (wscale / layer.extent) * px;
+				long long wy = wscale * y + (wscale / layer.extent) * py;
 
 				double lat, lon;
 				projection->unproject(wx, wy, 32, &lon, &lat);
@@ -380,8 +410,7 @@ void layer_to_geojson(mvt_layer const &layer, unsigned z, unsigned x, unsigned y
 				state.json_write_string("coordinates");
 
 				state.json_write_array();
-				state.json_write_float(ops[0].lon);
-				state.json_write_float(ops[0].lat);
+				write_coords(state, ops[0], scale);
 				state.json_end_array();
 			} else {
 				state.json_write_string("type");
@@ -392,8 +421,7 @@ void layer_to_geojson(mvt_layer const &layer, unsigned z, unsigned x, unsigned y
 
 				for (size_t i = 0; i < ops.size(); i++) {
 					state.json_write_array();
-					state.json_write_float(ops[i].lon);
-					state.json_write_float(ops[i].lat);
+					write_coords(state, ops[i], scale);
 					state.json_end_array();
 				}
 
@@ -416,8 +444,7 @@ void layer_to_geojson(mvt_layer const &layer, unsigned z, unsigned x, unsigned y
 
 				for (size_t i = 0; i < ops.size(); i++) {
 					state.json_write_array();
-					state.json_write_float(ops[i].lon);
-					state.json_write_float(ops[i].lat);
+					write_coords(state, ops[i], scale);
 					state.json_end_array();
 				}
 
@@ -435,8 +462,7 @@ void layer_to_geojson(mvt_layer const &layer, unsigned z, unsigned x, unsigned y
 					if (ops[i].op == VT_MOVETO) {
 						if (sstate == 0) {
 							state.json_write_array();
-							state.json_write_float(ops[i].lon);
-							state.json_write_float(ops[i].lat);
+							write_coords(state, ops[i], scale);
 							state.json_end_array();
 
 							sstate = 1;
@@ -445,16 +471,14 @@ void layer_to_geojson(mvt_layer const &layer, unsigned z, unsigned x, unsigned y
 							state.json_write_array();
 
 							state.json_write_array();
-							state.json_write_float(ops[i].lon);
-							state.json_write_float(ops[i].lat);
+							write_coords(state, ops[i], scale);
 							state.json_end_array();
 
 							sstate = 1;
 						}
 					} else {
 						state.json_write_array();
-						state.json_write_float(ops[i].lon);
-						state.json_write_float(ops[i].lat);
+						write_coords(state, ops[i], scale);
 						state.json_end_array();
 					}
 				}
@@ -488,7 +512,7 @@ void layer_to_geojson(mvt_layer const &layer, unsigned z, unsigned x, unsigned y
 						if (!warned) {
 							fprintf(stderr, "Ring does not end with closepath (ends with %d)\n", ops[i].op);
 							if (complain) {
-								exit(EXIT_FAILURE);
+								exit(EXIT_IMPOSSIBLE);
 							}
 
 							warned = true;
@@ -500,11 +524,11 @@ void layer_to_geojson(mvt_layer const &layer, unsigned z, unsigned x, unsigned y
 			int outer = 0;
 
 			for (size_t i = 0; i < rings.size(); i++) {
-				long double area = 0;
+				double area = 0;
 				for (size_t k = 0; k < rings[i].size(); k++) {
 					if (rings[i][k].op != VT_CLOSEPATH) {
-						area += (long double) rings[i][k].x * (long double) rings[i][(k + 1) % rings[i].size()].y;
-						area -= (long double) rings[i][k].y * (long double) rings[i][(k + 1) % rings[i].size()].x;
+						area += (double) rings[i][k].x * (double) rings[i][(k + 1) % rings[i].size()].y;
+						area -= (double) rings[i][k].y * (double) rings[i][(k + 1) % rings[i].size()].x;
 					}
 				}
 				area /= 2;
@@ -542,7 +566,7 @@ void layer_to_geojson(mvt_layer const &layer, unsigned z, unsigned x, unsigned y
 					if (!warned) {
 						fprintf(stderr, "Polygon begins with an inner ring\n");
 						if (complain) {
-							exit(EXIT_FAILURE);
+							exit(EXIT_IMPOSSIBLE);
 						}
 
 						warned = true;
@@ -570,13 +594,11 @@ void layer_to_geojson(mvt_layer const &layer, unsigned z, unsigned x, unsigned y
 				for (size_t j = 0; j < rings[i].size(); j++) {
 					if (rings[i][j].op != VT_CLOSEPATH) {
 						state.json_write_array();
-						state.json_write_float(rings[i][j].lon);
-						state.json_write_float(rings[i][j].lat);
+						write_coords(state, rings[i][j], scale);
 						state.json_end_array();
 					} else {
 						state.json_write_array();
-						state.json_write_float(rings[i][0].lon);
-						state.json_write_float(rings[i][0].lat);
+						write_coords(state, rings[i][j], scale);
 						state.json_end_array();
 					}
 				}

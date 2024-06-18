@@ -9,6 +9,7 @@
 #include "csv.hpp"
 #include "milo/dtoa_milo.h"
 #include "options.hpp"
+#include "errors.hpp"
 
 void parse_geocsv(std::vector<struct serialization_state> &sst, std::string fname, int layer, std::string layername) {
 	FILE *f;
@@ -19,7 +20,7 @@ void parse_geocsv(std::vector<struct serialization_state> &sst, std::string fnam
 		f = fopen(fname.c_str(), "r");
 		if (f == NULL) {
 			perror(fname.c_str());
-			exit(EXIT_FAILURE);
+			exit(EXIT_OPEN);
 		}
 	}
 
@@ -31,7 +32,7 @@ void parse_geocsv(std::vector<struct serialization_state> &sst, std::string fnam
 		std::string err = check_utf8(s);
 		if (err != "") {
 			fprintf(stderr, "%s: %s\n", fname.c_str(), err.c_str());
-			exit(EXIT_FAILURE);
+			exit(EXIT_UTF8);
 		}
 
 		header = csv_split(s.c_str());
@@ -53,7 +54,7 @@ void parse_geocsv(std::vector<struct serialization_state> &sst, std::string fnam
 
 	if (latcol < 0 || loncol < 0) {
 		fprintf(stderr, "%s: Can't find \"lat\" and \"lon\" columns\n", fname.c_str());
-		exit(EXIT_FAILURE);
+		exit(EXIT_CSV);
 	}
 
 	size_t seq = 0;
@@ -61,7 +62,7 @@ void parse_geocsv(std::vector<struct serialization_state> &sst, std::string fnam
 		std::string err = check_utf8(s);
 		if (err != "") {
 			fprintf(stderr, "%s: %s\n", fname.c_str(), err.c_str());
-			exit(EXIT_FAILURE);
+			exit(EXIT_UTF8);
 		}
 
 		seq++;
@@ -69,7 +70,7 @@ void parse_geocsv(std::vector<struct serialization_state> &sst, std::string fnam
 
 		if (line.size() != header.size()) {
 			fprintf(stderr, "%s:%zu: Mismatched column count: %zu in line, %zu in header\n", fname.c_str(), seq + 1, line.size(), header.size());
-			exit(EXIT_FAILURE);
+			exit(EXIT_CSV);
 		}
 
 		if (line[loncol].empty() || line[latcol].empty()) {
@@ -114,12 +115,11 @@ void parse_geocsv(std::vector<struct serialization_state> &sst, std::string fnam
 		serial_feature sf;
 
 		sf.layer = layer;
-		sf.layername = layername;
 		sf.segment = sst[0].segment;
 		sf.has_id = false;
 		sf.id = 0;
-		sf.has_tippecanoe_minzoom = false;
-		sf.has_tippecanoe_maxzoom = false;
+		sf.tippecanoe_minzoom = -1;
+		sf.tippecanoe_maxzoom = -1;
 		sf.feature_minzoom = false;
 		sf.seq = *(sst[0].layer_seq);
 		sf.geometry = dv;
@@ -127,13 +127,13 @@ void parse_geocsv(std::vector<struct serialization_state> &sst, std::string fnam
 		sf.full_keys = full_keys;
 		sf.full_values = full_values;
 
-		serialize_feature(&sst[0], sf);
+		serialize_feature(&sst[0], sf, layername);
 	}
 
 	if (fname.size() != 0) {
 		if (fclose(f) != 0) {
 			perror("fclose");
-			exit(EXIT_FAILURE);
+			exit(EXIT_CLOSE);
 		}
 	}
 }

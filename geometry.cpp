@@ -12,19 +12,16 @@
 #include <sqlite3.h>
 #include <mapbox/geometry/point.hpp>
 #include <mapbox/geometry/multi_polygon.hpp>
-#include <mapbox/geometry/wagyu/wagyu.hpp>
-#include <mapbox/geometry/wagyu/quick_clip.hpp>
 #include <mapbox/geometry/snap_rounding.hpp>
 #include "geometry.hpp"
 #include "projection.hpp"
 #include "serial.hpp"
 #include "main.hpp"
 #include "options.hpp"
+#include "errors.hpp"
+#include "projection.hpp"
 
-static int pnpoly(drawvec &vert, size_t start, size_t nvert, long long testx, long long testy);
-static int clip(double *x0, double *y0, double *x1, double *y1, double xmin, double ymin, double xmax, double ymax);
-
-drawvec decode_geometry(FILE *meta, std::atomic<long long> *geompos, int z, unsigned tx, unsigned ty, long long *bbox, unsigned initial_x, unsigned initial_y) {
+drawvec decode_geometry(const char **meta, int z, unsigned tx, unsigned ty, long long *bbox, unsigned initial_x, unsigned initial_y) {
 	drawvec out;
 
 	bbox[0] = LLONG_MAX;
@@ -37,10 +34,7 @@ drawvec decode_geometry(FILE *meta, std::atomic<long long> *geompos, int z, unsi
 	while (1) {
 		draw d;
 
-		if (!deserialize_byte_io(meta, &d.op, geompos)) {
-			fprintf(stderr, "Internal error: Unexpected end of file in geometry\n");
-			exit(EXIT_FAILURE);
-		}
+		deserialize_byte(meta, &d.op);
 		if (d.op == VT_END) {
 			break;
 		}
@@ -48,8 +42,8 @@ drawvec decode_geometry(FILE *meta, std::atomic<long long> *geompos, int z, unsi
 		if (d.op == VT_MOVETO || d.op == VT_LINETO) {
 			long long dx, dy;
 
-			deserialize_long_long_io(meta, &dx, geompos);
-			deserialize_long_long_io(meta, &dy, geompos);
+			deserialize_long_long(meta, &dx);
+			deserialize_long_long(meta, &dy);
 
 			wx += dx * (1 << geometry_scale);
 			wy += dy * (1 << geometry_scale);
@@ -62,18 +56,10 @@ drawvec decode_geometry(FILE *meta, std::atomic<long long> *geompos, int z, unsi
 				wwy -= ty << (32 - z);
 			}
 
-			if (wwx < bbox[0]) {
-				bbox[0] = wwx;
-			}
-			if (wwy < bbox[1]) {
-				bbox[1] = wwy;
-			}
-			if (wwx > bbox[2]) {
-				bbox[2] = wwx;
-			}
-			if (wwy > bbox[3]) {
-				bbox[3] = wwy;
-			}
+			bbox[0] = std::min(wwx, bbox[0]);
+			bbox[1] = std::min(wwy, bbox[1]);
+			bbox[2] = std::max(wwx, bbox[2]);
+			bbox[3] = std::max(wwy, bbox[3]);
 
 			d.x = wwx;
 			d.y = wwy;
@@ -83,245 +69,6 @@ drawvec decode_geometry(FILE *meta, std::atomic<long long> *geompos, int z, unsi
 	}
 
 	return out;
-}
-
-void to_tile_scale(drawvec &geom, int z, int detail) {
-	for (size_t i = 0; i < geom.size(); i++) {
-		geom[i].x >>= (32 - detail - z);
-		geom[i].y >>= (32 - detail - z);
-	}
-}
-
-drawvec remove_noop(drawvec geom, int type, int shift) {
-	// first pass: remove empty linetos
-
-	long long x = 0, y = 0;
-	drawvec out;
-
-	for (size_t i = 0; i < geom.size(); i++) {
-		if (geom[i].op == VT_LINETO && (geom[i].x >> shift) == x && (geom[i].y >> shift) == y) {
-			continue;
-		}
-
-		if (geom[i].op == VT_CLOSEPATH) {
-			out.push_back(geom[i]);
-		} else { /* moveto or lineto */
-			out.push_back(geom[i]);
-			x = geom[i].x >> shift;
-			y = geom[i].y >> shift;
-		}
-	}
-
-	// second pass: remove unused movetos
-
-	if (type != VT_POINT) {
-		geom = out;
-		out.resize(0);
-
-		for (size_t i = 0; i < geom.size(); i++) {
-			if (geom[i].op == VT_MOVETO) {
-				if (i + 1 >= geom.size()) {
-					continue;
-				}
-
-				if (geom[i + 1].op == VT_MOVETO) {
-					continue;
-				}
-
-				if (geom[i + 1].op == VT_CLOSEPATH) {
-					fprintf(stderr, "Shouldn't happen\n");
-					i++;  // also remove unused closepath
-					continue;
-				}
-			}
-
-			out.push_back(geom[i]);
-		}
-	}
-
-	// second pass: remove empty movetos
-
-	if (type == VT_LINE) {
-		geom = out;
-		out.resize(0);
-
-		for (size_t i = 0; i < geom.size(); i++) {
-			if (geom[i].op == VT_MOVETO) {
-				if (i > 0 && geom[i - 1].op == VT_LINETO && (geom[i - 1].x >> shift) == (geom[i].x >> shift) && (geom[i - 1].y >> shift) == (geom[i].y >> shift)) {
-					continue;
-				}
-			}
-
-			out.push_back(geom[i]);
-		}
-	}
-
-	return out;
-}
-
-double get_area(drawvec &geom, size_t i, size_t j) {
-	double area = 0;
-	for (size_t k = i; k < j; k++) {
-		area += (long double) geom[k].x * (long double) geom[i + ((k - i + 1) % (j - i))].y;
-		area -= (long double) geom[k].y * (long double) geom[i + ((k - i + 1) % (j - i))].x;
-	}
-	area /= 2;
-	return area;
-}
-
-double get_mp_area(drawvec &geom) {
-	double ret = 0;
-
-	for (size_t i = 0; i < geom.size(); i++) {
-		if (geom[i].op == VT_MOVETO) {
-			size_t j;
-
-			for (j = i + 1; j < geom.size(); j++) {
-				if (geom[j].op != VT_LINETO) {
-					break;
-				}
-			}
-
-			ret += get_area(geom, i, j);
-			i = j - 1;
-		}
-	}
-
-	return ret;
-}
-
-static void decode_clipped(mapbox::geometry::multi_polygon<long long> &t, drawvec &out) {
-	out.clear();
-
-	for (size_t i = 0; i < t.size(); i++) {
-		for (size_t j = 0; j < t[i].size(); j++) {
-			drawvec ring;
-
-			for (size_t k = 0; k < t[i][j].size(); k++) {
-				ring.push_back(draw((k == 0) ? VT_MOVETO : VT_LINETO, t[i][j][k].x, t[i][j][k].y));
-			}
-
-			if (ring.size() > 0 && ring[ring.size() - 1] != ring[0]) {
-				fprintf(stderr, "Had to close ring\n");
-				ring.push_back(draw(VT_LINETO, ring[0].x, ring[0].y));
-			}
-
-			double area = get_area(ring, 0, ring.size());
-
-			if ((j == 0 && area < 0) || (j != 0 && area > 0)) {
-				fprintf(stderr, "Ring area has wrong sign: %f for %zu\n", area, j);
-				exit(EXIT_FAILURE);
-			}
-
-			for (size_t k = 0; k < ring.size(); k++) {
-				out.push_back(ring[k]);
-			}
-		}
-	}
-}
-
-drawvec clean_or_clip_poly(drawvec &geom, int z, int buffer, bool clip) {
-	mapbox::geometry::wagyu::wagyu<long long> wagyu;
-
-	geom = remove_noop(geom, VT_POLYGON, 0);
-	for (size_t i = 0; i < geom.size(); i++) {
-		if (geom[i].op == VT_MOVETO) {
-			size_t j;
-			for (j = i + 1; j < geom.size(); j++) {
-				if (geom[j].op != VT_LINETO) {
-					break;
-				}
-			}
-
-			if (j >= i + 4) {
-				mapbox::geometry::linear_ring<long long> lr;
-
-				for (size_t k = i; k < j; k++) {
-					lr.push_back(mapbox::geometry::point<long long>(geom[k].x, geom[k].y));
-				}
-
-				if (lr.size() >= 3) {
-					wagyu.add_ring(lr);
-				}
-			}
-
-			i = j - 1;
-		}
-	}
-
-	if (clip) {
-		long long area = 0xFFFFFFFF;
-		if (z != 0) {
-			area = 1LL << (32 - z);
-		}
-		long long clip_buffer = buffer * area / 256;
-
-		mapbox::geometry::linear_ring<long long> lr;
-
-		lr.push_back(mapbox::geometry::point<long long>(-clip_buffer, -clip_buffer));
-		lr.push_back(mapbox::geometry::point<long long>(-clip_buffer, area + clip_buffer));
-		lr.push_back(mapbox::geometry::point<long long>(area + clip_buffer, area + clip_buffer));
-		lr.push_back(mapbox::geometry::point<long long>(area + clip_buffer, -clip_buffer));
-		lr.push_back(mapbox::geometry::point<long long>(-clip_buffer, -clip_buffer));
-
-		wagyu.add_ring(lr, mapbox::geometry::wagyu::polygon_type_clip);
-	}
-
-	mapbox::geometry::multi_polygon<long long> result;
-	try {
-		wagyu.execute(mapbox::geometry::wagyu::clip_type_union, result, mapbox::geometry::wagyu::fill_type_positive, mapbox::geometry::wagyu::fill_type_positive);
-	} catch (std::runtime_error e) {
-		FILE *f = fopen("/tmp/wagyu.log", "w");
-		fprintf(f, "%s\n", e.what());
-		fprintf(stderr, "%s\n", e.what());
-		fprintf(f, "[");
-
-		for (size_t i = 0; i < geom.size(); i++) {
-			if (geom[i].op == VT_MOVETO) {
-				size_t j;
-				for (j = i + 1; j < geom.size(); j++) {
-					if (geom[j].op != VT_LINETO) {
-						break;
-					}
-				}
-
-				if (j >= i + 4) {
-					mapbox::geometry::linear_ring<long long> lr;
-
-					if (i != 0) {
-						fprintf(f, ",");
-					}
-					fprintf(f, "[");
-
-					for (size_t k = i; k < j; k++) {
-						lr.push_back(mapbox::geometry::point<long long>(geom[k].x, geom[k].y));
-						if (k != i) {
-							fprintf(f, ",");
-						}
-						fprintf(f, "[%lld,%lld]", geom[k].x, geom[k].y);
-					}
-
-					fprintf(f, "]");
-
-					if (lr.size() >= 3) {
-					}
-				}
-
-				i = j - 1;
-			}
-		}
-
-		fprintf(f, "]");
-		fprintf(f, "\n\n\n\n\n");
-
-		fclose(f);
-		fprintf(stderr, "Internal error: Polygon cleaning failed. Log in /tmp/wagyu.log\n");
-		exit(EXIT_FAILURE);
-	}
-
-	drawvec ret;
-	decode_clipped(result, ret);
-	return ret;
 }
 
 /* pnpoly:
@@ -335,7 +82,7 @@ The name of W. Randolph Franklin may not be used to endorse or promote products 
 THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 */
 
-static int pnpoly(drawvec &vert, size_t start, size_t nvert, long long testx, long long testy) {
+int pnpoly(const drawvec &vert, size_t start, size_t nvert, long long testx, long long testy) {
 	size_t i, j;
 	bool c = false;
 	for (i = 0, j = nvert - 1; i < nvert; j = i++) {
@@ -363,13 +110,13 @@ void check_polygon(drawvec &geom) {
 				mapbox::geometry::linear_ring<long long> lr;
 
 				for (size_t k = i; k < j; k++) {
-					lr.push_back(mapbox::geometry::point<long long>(geom[k].x, geom[k].y));
+					lr.push_back({geom[k].x, geom[k].y});
 				}
 
 				if (lr.size() >= 3) {
 					mapbox::geometry::polygon<long long> p;
-					p.push_back(lr);
-					mp.push_back(p);
+					p.push_back(std::move(lr));
+					mp.push_back(std::move(p));
 				}
 			}
 
@@ -396,10 +143,6 @@ void check_polygon(drawvec &geom) {
 
 			double area = get_area(geom, i, j);
 
-#if 0
-			fprintf(stderr, "looking at %lld to %lld, area %f\n", (long long) i, (long long) j, area);
-#endif
-
 			if (area > 0) {
 				outer_start = i;
 				outer_len = j - i;
@@ -416,13 +159,7 @@ void check_polygon(drawvec &geom) {
 						}
 
 						if (!on_edge) {
-							printf("%lld,%lld at %lld not in outer ring (%lld to %lld)\n", geom[k].x, geom[k].y, (long long) k, (long long) outer_start, (long long) (outer_start + outer_len));
-
-#if 0
-							for (size_t l = outer_start; l < outer_start + outer_len; l++) {
-								fprintf(stderr, " %lld,%lld", geom[l].x, geom[l].y);
-							}
-#endif
+							fprintf(stderr, "%lld,%lld at %lld not in outer ring (%lld to %lld)\n", geom[k].x, geom[k].y, (long long) k, (long long) outer_start, (long long) (outer_start + outer_len));
 						}
 					}
 				}
@@ -431,96 +168,13 @@ void check_polygon(drawvec &geom) {
 	}
 }
 
-drawvec close_poly(drawvec &geom) {
+drawvec reduce_tiny_poly(drawvec const &geom, int z, int detail, bool *still_needs_simplification, bool *reduced_away, double *accum_area) {
 	drawvec out;
+	const double pixel = (1LL << (32 - detail - z)) * (double) tiny_polygon_size;
 
-	for (size_t i = 0; i < geom.size(); i++) {
-		if (geom[i].op == VT_MOVETO) {
-			size_t j;
-			for (j = i + 1; j < geom.size(); j++) {
-				if (geom[j].op != VT_LINETO) {
-					break;
-				}
-			}
-
-			if (j - 1 > i) {
-				if (geom[j - 1].x != geom[i].x || geom[j - 1].y != geom[i].y) {
-					fprintf(stderr, "Internal error: polygon not closed\n");
-				}
-			}
-
-			for (size_t n = i; n < j - 1; n++) {
-				out.push_back(geom[n]);
-			}
-			out.push_back(draw(VT_CLOSEPATH, 0, 0));
-
-			i = j - 1;
-		}
-	}
-
-	return out;
-}
-
-drawvec simple_clip_poly(drawvec &geom, long long minx, long long miny, long long maxx, long long maxy) {
-	drawvec out;
-
-	mapbox::geometry::point<long long> min(minx, miny);
-	mapbox::geometry::point<long long> max(maxx, maxy);
-	mapbox::geometry::box<long long> bbox(min, max);
-
-	for (size_t i = 0; i < geom.size(); i++) {
-		if (geom[i].op == VT_MOVETO) {
-			size_t j;
-			for (j = i + 1; j < geom.size(); j++) {
-				if (geom[j].op != VT_LINETO) {
-					break;
-				}
-			}
-
-			mapbox::geometry::linear_ring<long long> ring;
-			for (size_t k = i; k < j; k++) {
-				ring.push_back(mapbox::geometry::point<long long>(geom[k].x, geom[k].y));
-			}
-
-			mapbox::geometry::linear_ring<long long> lr = mapbox::geometry::wagyu::quick_clip::quick_lr_clip(ring, bbox);
-
-			if (lr.size() > 0) {
-				for (size_t k = 0; k < lr.size(); k++) {
-					if (k == 0) {
-						out.push_back(draw(VT_MOVETO, lr[k].x, lr[k].y));
-					} else {
-						out.push_back(draw(VT_LINETO, lr[k].x, lr[k].y));
-					}
-				}
-
-				if (lr.size() > 0 && lr[0] != lr[lr.size() - 1]) {
-					out.push_back(draw(VT_LINETO, lr[0].x, lr[0].y));
-				}
-			}
-
-			i = j - 1;
-		} else {
-			fprintf(stderr, "Unexpected operation in polygon %d\n", (int) geom[i].op);
-			exit(EXIT_FAILURE);
-		}
-	}
-
-	return out;
-}
-
-drawvec simple_clip_poly(drawvec &geom, int z, int buffer) {
-	long long area = 1LL << (32 - z);
-	long long clip_buffer = buffer * area / 256;
-
-	return simple_clip_poly(geom, -clip_buffer, -clip_buffer, area + clip_buffer, area + clip_buffer);
-}
-
-drawvec reduce_tiny_poly(drawvec &geom, int z, int detail, bool *reduced, double *accum_area) {
-	drawvec out;
-	long long pixel = (1 << (32 - detail - z)) * 2;
-
-	*reduced = true;
 	bool included_last_outer = false;
+	*still_needs_simplification = false;
+	*reduced_away = false;
 
 	for (size_t i = 0; i < geom.size(); i++) {
 		if (geom[i].op == VT_MOVETO) {
@@ -544,18 +198,23 @@ drawvec reduce_tiny_poly(drawvec &geom, int z, int detail, bool *reduced, double
 				// inner rings must just have their area de-accumulated rather
 				// than being drawn since we don't really know where they are.
 
-				if (std::fabs(area) <= pixel * pixel || (area < 0 && !included_last_outer)) {
-					// printf("area is only %f vs %lld so using square\n", area, pixel * pixel);
-
+				// i.e., this outer ring is small enough that we are including it
+				// in a tiny polygon rather than letting it represent itself,
+				// OR it is an inner ring and we haven't output an outer ring for it to be
+				// cut out of, so we are just subtracting its area from the tiny polygon
+				// rather than trying to deal with it geometrically
+				if ((area > 0 && area <= pixel * pixel) || (area < 0 && !included_last_outer)) {
 					*accum_area += area;
+					*reduced_away = true;
+
 					if (area > 0 && *accum_area > pixel * pixel) {
 						// XXX use centroid;
 
-						out.push_back(draw(VT_MOVETO, geom[i].x - pixel / 2, geom[i].y - pixel / 2));
-						out.push_back(draw(VT_LINETO, geom[i].x + pixel / 2, geom[i].y - pixel / 2));
-						out.push_back(draw(VT_LINETO, geom[i].x + pixel / 2, geom[i].y + pixel / 2));
-						out.push_back(draw(VT_LINETO, geom[i].x - pixel / 2, geom[i].y + pixel / 2));
-						out.push_back(draw(VT_LINETO, geom[i].x - pixel / 2, geom[i].y - pixel / 2));
+						out.emplace_back(VT_MOVETO, geom[i].x - pixel / 2, geom[i].y - pixel / 2);
+						out.emplace_back(VT_LINETO, geom[i].x - pixel / 2 + pixel, geom[i].y - pixel / 2);
+						out.emplace_back(VT_LINETO, geom[i].x - pixel / 2 + pixel, geom[i].y - pixel / 2 + pixel);
+						out.emplace_back(VT_LINETO, geom[i].x - pixel / 2, geom[i].y - pixel / 2 + pixel);
+						out.emplace_back(VT_LINETO, geom[i].x - pixel / 2, geom[i].y - pixel / 2);
 
 						*accum_area -= pixel * pixel;
 					}
@@ -563,19 +222,28 @@ drawvec reduce_tiny_poly(drawvec &geom, int z, int detail, bool *reduced, double
 					if (area > 0) {
 						included_last_outer = false;
 					}
-				} else {
-					// printf("area is %f so keeping instead of %lld\n", area, pixel * pixel);
-
-					for (size_t k = i; k <= j && k < geom.size(); k++) {
+				}
+				// i.e., this ring is large enough that it gets to represent itself
+				// or it is a tiny hole out of a real polygon, which we are still treating
+				// as a real geometry because otherwise we can accumulate enough tiny holes
+				// that we will drop the next several outer rings getting back up to 0.
+				else {
+					for (size_t k = i; k < j && k < geom.size(); k++) {
 						out.push_back(geom[k]);
 					}
 
-					*reduced = false;
+					// which means that the overall polygon has a real geometry,
+					// which means that it gets to be simplified.
+					*still_needs_simplification = true;
 
 					if (area > 0) {
 						included_last_outer = true;
 					}
 				}
+			} else {
+				// area is 0: doesn't count as either having been reduced away,
+				// since it was probably just degenerate from having been clipped,
+				// or as needing simplification, since it produces no output.
 			}
 
 			i = j - 1;
@@ -594,34 +262,22 @@ drawvec reduce_tiny_poly(drawvec &geom, int z, int detail, bool *reduced, double
 	return out;
 }
 
-drawvec clip_point(drawvec &geom, int z, long long buffer) {
+int quick_check(const long long *bbox, int z, long long buffer) {
 	long long min = 0;
 	long long area = 1LL << (32 - z);
 
-	min -= buffer * area / 256;
-	area += buffer * area / 256;
-
-	return clip_point(geom, min, min, area, area);
-}
-
-drawvec clip_point(drawvec &geom, long long minx, long long miny, long long maxx, long long maxy) {
-	drawvec out;
-
-	for (size_t i = 0; i < geom.size(); i++) {
-		if (geom[i].x >= minx && geom[i].y >= miny && geom[i].x <= maxx && geom[i].y <= maxy) {
-			out.push_back(geom[i]);
-		}
+	// bbox entirely within the tile proper
+	if (bbox[0] > min && bbox[1] > min && bbox[2] < area && bbox[3] < area) {
+		return 1;
 	}
 
-	return out;
-}
-
-int quick_check(long long *bbox, int z, long long buffer) {
-	long long min = 0;
-	long long area = 1LL << (32 - z);
-
 	min -= buffer * area / 256;
 	area += buffer * area / 256;
+
+	// bbox entirely within the tile, including its buffer
+	if (bbox[0] > min && bbox[1] > min && bbox[2] < area && bbox[3] < area) {
+		return 3;
+	}
 
 	// bbox entirely outside the tile
 	if (bbox[0] > area || bbox[1] > area) {
@@ -629,11 +285,6 @@ int quick_check(long long *bbox, int z, long long buffer) {
 	}
 	if (bbox[2] < min || bbox[3] < min) {
 		return 0;
-	}
-
-	// bbox entirely within the tile
-	if (bbox[0] > min && bbox[1] > min && bbox[2] < area && bbox[3] < area) {
-		return 1;
 	}
 
 	// some overlap of edge
@@ -649,54 +300,22 @@ bool point_within_tile(long long x, long long y, int z) {
 	return x >= 0 && y >= 0 && x < area && y < area;
 }
 
-drawvec clip_lines(drawvec &geom, int z, long long buffer) {
-	long long min = 0;
-	long long area = 1LL << (32 - z);
-	min -= buffer * area / 256;
-	area += buffer * area / 256;
+double distance_from_line(long long point_x, long long point_y, long long segA_x, long long segA_y, long long segB_x, long long segB_y) {
+	long long p2x = segB_x - segA_x;
+	long long p2y = segB_y - segA_y;
 
-	return clip_lines(geom, min, min, area, area);
-}
+	// These calculations must be made in integers instead of floating point
+	// to make them consistent between x86 and arm floating point implementations.
+	//
+	// Coordinates may be up to 34 bits, so their product is up to 68 bits,
+	// making their sum up to 69 bits. Downshift before multiplying to keep them in range.
+	double something = ((p2x / 4) * (p2x / 8) + (p2y / 4) * (p2y / 8)) * 32.0;
+	// likewise
+	double u = (0 == something) ? 0 : ((point_x - segA_x) / 4 * (p2x / 8) + (point_y - segA_y) / 4 * (p2y / 8)) * 32.0 / (something);
 
-drawvec clip_lines(drawvec &geom, long long minx, long long miny, long long maxx, long long maxy) {
-	drawvec out;
-
-	for (size_t i = 0; i < geom.size(); i++) {
-		if (i > 0 && (geom[i - 1].op == VT_MOVETO || geom[i - 1].op == VT_LINETO) && geom[i].op == VT_LINETO) {
-			double x1 = geom[i - 1].x;
-			double y1 = geom[i - 1].y;
-
-			double x2 = geom[i - 0].x;
-			double y2 = geom[i - 0].y;
-
-			int c = clip(&x1, &y1, &x2, &y2, minx, miny, maxx, maxy);
-
-			if (c > 1) {  // clipped
-				out.push_back(draw(VT_MOVETO, x1, y1));
-				out.push_back(draw(VT_LINETO, x2, y2));
-				out.push_back(draw(VT_MOVETO, geom[i].x, geom[i].y));
-			} else if (c == 1) {  // unchanged
-				out.push_back(geom[i]);
-			} else {  // clipped away entirely
-				out.push_back(draw(VT_MOVETO, geom[i].x, geom[i].y));
-			}
-		} else {
-			out.push_back(geom[i]);
-		}
-	}
-
-	return out;
-}
-
-static double square_distance_from_line(long long point_x, long long point_y, long long segA_x, long long segA_y, long long segB_x, long long segB_y) {
-	double p2x = segB_x - segA_x;
-	double p2y = segB_y - segA_y;
-	double something = p2x * p2x + p2y * p2y;
-	double u = 0 == something ? 0 : ((point_x - segA_x) * p2x + (point_y - segA_y) * p2y) / something;
-
-	if (u > 1) {
+	if (u >= 1) {
 		u = 1;
-	} else if (u < 0) {
+	} else if (u <= 0) {
 		u = 0;
 	}
 
@@ -706,27 +325,38 @@ static double square_distance_from_line(long long point_x, long long point_y, lo
 	double dx = x - point_x;
 	double dy = y - point_y;
 
-	return dx * dx + dy * dy;
+	double out = std::round(sqrt(dx * dx + dy * dy) * 16.0) / 16.0;
+	return out;
 }
 
 // https://github.com/Project-OSRM/osrm-backend/blob/733d1384a40f/Algorithms/DouglasePeucker.cpp
 static void douglas_peucker(drawvec &geom, int start, int n, double e, size_t kept, size_t retain) {
-	e = e * e;
 	std::stack<int> recursion_stack;
 
-	{
-		int left_border = 0;
-		int right_border = 1;
-		// Sweep linerarily over array and identify those ranges that need to be checked
-		do {
-			if (geom[start + right_border].necessary) {
-				recursion_stack.push(left_border);
-				recursion_stack.push(right_border);
-				left_border = right_border;
-			}
-			++right_border;
-		} while (right_border < n);
+	if (!geom[start + 0].necessary || !geom[start + n - 1].necessary) {
+		fprintf(stderr, "endpoints not marked necessary\n");
+		exit(EXIT_IMPOSSIBLE);
 	}
+
+	int prev = 0;
+	for (int here = 1; here < n; here++) {
+		if (geom[start + here].necessary) {
+			recursion_stack.push(prev);
+			recursion_stack.push(here);
+			prev = here;
+
+			if (prevent[P_SIMPLIFY_SHARED_NODES]) {
+				if (retain > 0) {
+					retain--;
+				}
+			}
+		}
+	}
+	// These segments are put on the stack from start to end,
+	// independent of winding, so note that anything that uses
+	// "retain" to force it to keep at least N points will
+	// keep a different set of points when wound one way than
+	// when wound the other way.
 
 	while (!recursion_stack.empty()) {
 		// pop next element
@@ -736,18 +366,33 @@ static void douglas_peucker(drawvec &geom, int start, int n, double e, size_t ke
 		recursion_stack.pop();
 
 		double max_distance = -1;
-		int farthest_element_index = second;
+		int farthest_element_index;
 
 		// find index idx of element with max_distance
 		int i;
-		for (i = first + 1; i < second; i++) {
-			double temp_dist = square_distance_from_line(geom[start + i].x, geom[start + i].y, geom[start + first].x, geom[start + first].y, geom[start + second].x, geom[start + second].y);
+		if (geom[start + first] < geom[start + second]) {
+			farthest_element_index = first;
+			for (i = first + 1; i < second; i++) {
+				double temp_dist = distance_from_line(geom[start + i].x, geom[start + i].y, geom[start + first].x, geom[start + first].y, geom[start + second].x, geom[start + second].y);
 
-			double distance = std::fabs(temp_dist);
+				double distance = std::fabs(temp_dist);
 
-			if ((distance > e || kept < retain) && distance > max_distance) {
-				farthest_element_index = i;
-				max_distance = distance;
+				if ((distance > e || kept < retain) && (distance > max_distance || (distance == max_distance && geom[start + i] < geom[start + farthest_element_index]))) {
+					farthest_element_index = i;
+					max_distance = distance;
+				}
+			}
+		} else {
+			farthest_element_index = second;
+			for (i = second - 1; i > first; i--) {
+				double temp_dist = distance_from_line(geom[start + i].x, geom[start + i].y, geom[start + second].x, geom[start + second].y, geom[start + first].x, geom[start + first].y);
+
+				double distance = std::fabs(temp_dist);
+
+				if ((distance > e || kept < retain) && (distance > max_distance || (distance == max_distance && geom[start + i] < geom[start + farthest_element_index]))) {
+					farthest_element_index = i;
+					max_distance = distance;
+				}
 			}
 		}
 
@@ -756,13 +401,24 @@ static void douglas_peucker(drawvec &geom, int start, int n, double e, size_t ke
 			geom[start + farthest_element_index].necessary = 1;
 			kept++;
 
-			if (1 < farthest_element_index - first) {
-				recursion_stack.push(first);
-				recursion_stack.push(farthest_element_index);
-			}
-			if (1 < second - farthest_element_index) {
-				recursion_stack.push(farthest_element_index);
-				recursion_stack.push(second);
+			if (geom[start + first] < geom[start + second]) {
+				if (1 < farthest_element_index - first) {
+					recursion_stack.push(first);
+					recursion_stack.push(farthest_element_index);
+				}
+				if (1 < second - farthest_element_index) {
+					recursion_stack.push(farthest_element_index);
+					recursion_stack.push(second);
+				}
+			} else {
+				if (1 < second - farthest_element_index) {
+					recursion_stack.push(farthest_element_index);
+					recursion_stack.push(second);
+				}
+				if (1 < farthest_element_index - first) {
+					recursion_stack.push(first);
+					recursion_stack.push(farthest_element_index);
+				}
 			}
 		}
 	}
@@ -771,26 +427,26 @@ static void douglas_peucker(drawvec &geom, int start, int n, double e, size_t ke
 // If any line segment crosses a tile boundary, add a node there
 // that cannot be simplified away, to prevent the edge of any
 // feature from jumping abruptly at the tile boundary.
-drawvec impose_tile_boundaries(drawvec &geom, long long extent) {
+drawvec impose_tile_boundaries(const drawvec &geom, long long extent) {
 	drawvec out;
 
 	for (size_t i = 0; i < geom.size(); i++) {
 		if (i > 0 && geom[i].op == VT_LINETO && (geom[i - 1].op == VT_MOVETO || geom[i - 1].op == VT_LINETO)) {
-			double x1 = geom[i - 1].x;
-			double y1 = geom[i - 1].y;
+			long long x1 = geom[i - 1].x;
+			long long y1 = geom[i - 1].y;
 
-			double x2 = geom[i - 0].x;
-			double y2 = geom[i - 0].y;
+			long long x2 = geom[i - 0].x;
+			long long y2 = geom[i - 0].y;
 
 			int c = clip(&x1, &y1, &x2, &y2, 0, 0, extent, extent);
 
 			if (c > 1) {  // clipped
 				if (x1 != geom[i - 1].x || y1 != geom[i - 1].y) {
-					out.push_back(draw(VT_LINETO, x1, y1));
+					out.emplace_back(VT_LINETO, x1, y1);
 					out[out.size() - 1].necessary = 1;
 				}
 				if (x2 != geom[i - 0].x || y2 != geom[i - 0].y) {
-					out.push_back(draw(VT_LINETO, x2, y2));
+					out.emplace_back(VT_LINETO, x2, y2);
 					out[out.size() - 1].necessary = 1;
 				}
 			}
@@ -802,7 +458,7 @@ drawvec impose_tile_boundaries(drawvec &geom, long long extent) {
 	return out;
 }
 
-drawvec simplify_lines(drawvec &geom, int z, int detail, bool mark_tile_bounds, double simplification, size_t retain, drawvec const &shared_nodes) {
+drawvec simplify_lines(drawvec &geom, int z, int tx, int ty, int detail, bool mark_tile_bounds, double simplification, size_t retain, drawvec const &shared_nodes, struct node *shared_nodes_map, size_t nodepos) {
 	int res = 1 << (32 - detail - z);
 	long long area = 1LL << (32 - z);
 
@@ -811,14 +467,41 @@ drawvec simplify_lines(drawvec &geom, int z, int detail, bool mark_tile_bounds, 
 			geom[i].necessary = 1;
 		} else if (geom[i].op == VT_LINETO) {
 			geom[i].necessary = 0;
+			// if this is actually the endpoint, not an intermediate point,
+			// it will be marked as necessary below
 		} else {
 			geom[i].necessary = 1;
 		}
 
 		if (prevent[P_SIMPLIFY_SHARED_NODES]) {
+			// This is kind of weird, because we have two lists of shared nodes to look through:
+			// * the drawvec, which is nodes that were introduced during clipping to the tile edge,
+			//   and which are in local tile coordinates
+			// * the shared_nodes_map, which was made globally before tiling began, and which
+			//   is in global quadkey coordinates.
+			// To look through the latter, we need to offset and encode the coordinates
+			// of the feature we are simplifying.
+
 			auto pt = std::lower_bound(shared_nodes.begin(), shared_nodes.end(), geom[i]);
 			if (pt != shared_nodes.end() && *pt == geom[i]) {
 				geom[i].necessary = true;
+			}
+
+			if (nodepos > 0) {
+				// offset to global
+				draw d = geom[i];
+				if (z != 0) {
+					d.x += tx * (1LL << (32 - z));
+					d.y += ty * (1LL << (32 - z));
+				}
+
+				// to quadkey
+				struct node n;
+				n.index = encode_quadkey((unsigned) d.x, (unsigned) d.y);
+
+				if (bsearch(&n, shared_nodes_map, nodepos / sizeof(node), sizeof(node), nodecmp) != NULL) {
+					geom[i].necessary = true;
+				}
 			}
 		}
 	}
@@ -839,24 +522,35 @@ drawvec simplify_lines(drawvec &geom, int z, int detail, bool mark_tile_bounds, 
 			geom[i].necessary = 1;
 			geom[j - 1].necessary = 1;
 
+			// empirical mapping from douglas-peucker simplifications
+			// to visvalingam simplifications that yield similar
+			// output sizes
+			double sim = simplification * (0.1596 * z + 0.878);
+			double scale = (res * sim) * (res * sim);
+			scale = exp(1.002 * log(scale) + 0.3043);
+
 			if (j - i > 1) {
-				douglas_peucker(geom, i, j - i, res * simplification, 2, retain);
+				if (additional[A_VISVALINGAM]) {
+					visvalingam(geom, i, j, scale, retain);
+				} else {
+					douglas_peucker(geom, i, j - i, res * simplification, 2, retain);
+				}
 			}
 			i = j - 1;
 		}
 	}
 
-	drawvec out;
+	size_t out = 0;
 	for (size_t i = 0; i < geom.size(); i++) {
 		if (geom[i].necessary) {
-			out.push_back(geom[i]);
+			geom[out++] = geom[i];
 		}
 	}
-
-	return out;
+	geom.resize(out);
+	return geom;
 }
 
-drawvec reorder_lines(drawvec &geom) {
+drawvec reorder_lines(const drawvec &geom) {
 	// Only reorder simple linestrings with a single moveto
 
 	if (geom.size() == 0) {
@@ -866,13 +560,16 @@ drawvec reorder_lines(drawvec &geom) {
 	for (size_t i = 0; i < geom.size(); i++) {
 		if (geom[i].op == VT_MOVETO) {
 			if (i != 0) {
+				// moveto is not at the start, so it is not simple
 				return geom;
 			}
 		} else if (geom[i].op == VT_LINETO) {
 			if (i == 0) {
+				// lineto is at the start: can't happen
 				return geom;
 			}
 		} else {
+			// something other than moveto or lineto: can't happen
 			return geom;
 		}
 	}
@@ -890,14 +587,16 @@ drawvec reorder_lines(drawvec &geom) {
 			out.push_back(geom[geom.size() - 1 - i]);
 		}
 		out[0].op = VT_MOVETO;
-		out[out.size() - 1].op = VT_LINETO;
+		if (out.size() > 1) {
+			out[out.size() - 1].op = VT_LINETO;
+		}
 		return out;
 	}
 
 	return geom;
 }
 
-drawvec fix_polygon(drawvec &geom) {
+drawvec fix_polygon(const drawvec &geom) {
 	int outer = 1;
 	drawvec out;
 
@@ -914,6 +613,16 @@ drawvec fix_polygon(drawvec &geom) {
 				}
 			}
 
+			// A polygon ring must contain at least three points
+			// (and really should contain four). If this one does
+			// not have any, avoid a division by zero trying to
+			// calculate the centroid below.
+			if (j - i < 1) {
+				i = j - 1;
+				outer = 0;
+				continue;
+			}
+
 			// Make a temporary copy of the ring.
 			// Close it if it isn't closed.
 
@@ -922,6 +631,13 @@ drawvec fix_polygon(drawvec &geom) {
 				ring.push_back(geom[a]);
 			}
 			if (j - i != 0 && (ring[0].x != ring[j - i - 1].x || ring[0].y != ring[j - i - 1].y)) {
+				ring.push_back(ring[0]);
+			}
+
+			// A polygon ring at this point should contain at least four points.
+			// Flesh it out with some vertex copies if it doesn't.
+
+			while (ring.size() < 4) {
 				ring.push_back(ring[0]);
 			}
 
@@ -950,14 +666,67 @@ drawvec fix_polygon(drawvec &geom) {
 				ring = tmp;
 			}
 
+			// Now we are rotating the ring to make the first/last point
+			// one that would be unlikely to be simplified away.
+
+			// calculate centroid
+			// a + 1 < size() because point 0 is duplicated at the end
+			long long xtotal = 0;
+			long long ytotal = 0;
+			long long count = 0;
+			for (size_t a = 0; a + 1 < ring.size(); a++) {
+				xtotal += ring[a].x;
+				ytotal += ring[a].y;
+				count++;
+			}
+			xtotal /= count;
+			ytotal /= count;
+
+			// figure out which point is furthest from the centroid
+			long long dist2 = 0;
+			long long furthest = 0;
+			for (size_t a = 0; a + 1 < ring.size(); a++) {
+				// division by 16 because these are z0 coordinates and we need to avoid overflow
+				long long xd = (ring[a].x - xtotal) / 16;
+				long long yd = (ring[a].y - ytotal) / 16;
+				long long d2 = xd * xd + yd * yd;
+				if (d2 > dist2 || (d2 == dist2 && ring[a] < ring[furthest])) {
+					dist2 = d2;
+					furthest = a;
+				}
+			}
+
+			// then figure out which point is furthest from *that*,
+			// which will hopefully be a good origin point since it should be
+			// at a far edge of the shape.
+			long long dist2b = 0;
+			long long furthestb = 0;
+			for (size_t a = 0; a + 1 < ring.size(); a++) {
+				// division by 16 because these are z0 coordinates and we need to avoid overflow
+				long long xd = (ring[a].x - ring[furthest].x) / 16;
+				long long yd = (ring[a].y - ring[furthest].y) / 16;
+				long long d2 = xd * xd + yd * yd;
+				if (d2 > dist2b || (d2 == dist2b && ring[a] < ring[furthestb])) {
+					dist2b = d2;
+					furthestb = a;
+				}
+			}
+
+			// rotate ring so the furthest point is the duplicated one.
+			// the idea is that simplification will then be more efficient,
+			// never wasting the start and end points, which are always retained,
+			// on a point that has little impact on the shape.
+
 			// Copy ring into output, fixing the moveto/lineto ops if necessary because of
 			// reversal or closing
 
 			for (size_t a = 0; a < ring.size(); a++) {
+				size_t a2 = (a + furthestb) % (ring.size() - 1);
+
 				if (a == 0) {
-					out.push_back(draw(VT_MOVETO, ring[a].x, ring[a].y));
+					out.push_back(draw(VT_MOVETO, ring[a2].x, ring[a2].y));
 				} else {
-					out.push_back(draw(VT_LINETO, ring[a].x, ring[a].y));
+					out.push_back(draw(VT_LINETO, ring[a2].x, ring[a2].y));
 				}
 			}
 
@@ -968,13 +737,14 @@ drawvec fix_polygon(drawvec &geom) {
 			outer = 0;
 		} else {
 			fprintf(stderr, "Internal error: polygon ring begins with %d, not moveto\n", geom[i].op);
-			exit(EXIT_FAILURE);
+			exit(EXIT_IMPOSSIBLE);
 		}
 	}
 
 	return out;
 }
 
+#if 0
 std::vector<drawvec> chop_polygon(std::vector<drawvec> &geoms) {
 	while (1) {
 		bool again = false;
@@ -1018,15 +788,11 @@ std::vector<drawvec> chop_polygon(std::vector<drawvec> &geoms) {
 				drawvec c1, c2;
 
 				if (maxy - miny > maxx - minx) {
-					// printf("clipping y to %lld %lld %lld %lld\n", minx, miny, maxx, midy);
-					c1 = simple_clip_poly(geoms[i], minx, miny, maxx, midy);
-					// printf("          and %lld %lld %lld %lld\n", minx, midy, maxx, maxy);
-					c2 = simple_clip_poly(geoms[i], minx, midy, maxx, maxy);
+					c1 = simple_clip_poly(geoms[i], minx, miny, maxx, midy, prevent[P_SIMPLIFY_EDGE_NODES]);
+					c2 = simple_clip_poly(geoms[i], minx, midy, maxx, maxy, prevent[P_SIMPLIFY_EDGE_NODES]);
 				} else {
-					// printf("clipping x to %lld %lld %lld %lld\n", minx, miny, midx, maxy);
-					c1 = simple_clip_poly(geoms[i], minx, miny, midx, maxy);
-					// printf("          and %lld %lld %lld %lld\n", midx, midy, maxx, maxy);
-					c2 = simple_clip_poly(geoms[i], midx, miny, maxx, maxy);
+					c1 = simple_clip_poly(geoms[i], minx, miny, midx, maxy, prevent[P_SIMPLIFY_EDGE_NODES]);
+					c2 = simple_clip_poly(geoms[i], midx, miny, maxx, maxy, prevent[P_SIMPLIFY_EDGE_NODES]);
 				}
 
 				if (c1.size() >= geoms[i].size()) {
@@ -1053,97 +819,15 @@ std::vector<drawvec> chop_polygon(std::vector<drawvec> &geoms) {
 		geoms = out;
 	}
 }
-
-#define INSIDE 0
-#define LEFT 1
-#define RIGHT 2
-#define BOTTOM 4
-#define TOP 8
-
-static int computeOutCode(double x, double y, double xmin, double ymin, double xmax, double ymax) {
-	int code = INSIDE;
-
-	if (x < xmin) {
-		code |= LEFT;
-	} else if (x > xmax) {
-		code |= RIGHT;
-	}
-
-	if (y < ymin) {
-		code |= BOTTOM;
-	} else if (y > ymax) {
-		code |= TOP;
-	}
-
-	return code;
-}
-
-static int clip(double *x0, double *y0, double *x1, double *y1, double xmin, double ymin, double xmax, double ymax) {
-	int outcode0 = computeOutCode(*x0, *y0, xmin, ymin, xmax, ymax);
-	int outcode1 = computeOutCode(*x1, *y1, xmin, ymin, xmax, ymax);
-	int accept = 0;
-	int changed = 0;
-
-	while (1) {
-		if (!(outcode0 | outcode1)) {  // Bitwise OR is 0. Trivially accept and get out of loop
-			accept = 1;
-			break;
-		} else if (outcode0 & outcode1) {  // Bitwise AND is not 0. Trivially reject and get out of loop
-			break;
-		} else {
-			// failed both tests, so calculate the line segment to clip
-			// from an outside point to an intersection with clip edge
-			double x = *x0, y = *y0;
-
-			// At least one endpoint is outside the clip rectangle; pick it.
-			int outcodeOut = outcode0 ? outcode0 : outcode1;
-
-			// Now find the intersection point;
-			// use formulas y = y0 + slope * (x - x0), x = x0 + (1 / slope) * (y - y0)
-			if (outcodeOut & TOP) {  // point is above the clip rectangle
-				x = *x0 + (*x1 - *x0) * (ymax - *y0) / (*y1 - *y0);
-				y = ymax;
-			} else if (outcodeOut & BOTTOM) {  // point is below the clip rectangle
-				x = *x0 + (*x1 - *x0) * (ymin - *y0) / (*y1 - *y0);
-				y = ymin;
-			} else if (outcodeOut & RIGHT) {  // point is to the right of clip rectangle
-				y = *y0 + (*y1 - *y0) * (xmax - *x0) / (*x1 - *x0);
-				x = xmax;
-			} else if (outcodeOut & LEFT) {  // point is to the left of clip rectangle
-				y = *y0 + (*y1 - *y0) * (xmin - *x0) / (*x1 - *x0);
-				x = xmin;
-			}
-
-			// Now we move outside point to intersection point to clip
-			// and get ready for next pass.
-			if (outcodeOut == outcode0) {
-				*x0 = x;
-				*y0 = y;
-				outcode0 = computeOutCode(*x0, *y0, xmin, ymin, xmax, ymax);
-				changed = 1;
-			} else {
-				*x1 = x;
-				*y1 = y;
-				outcode1 = computeOutCode(*x1, *y1, xmin, ymin, xmax, ymax);
-				changed = 1;
-			}
-		}
-	}
-
-	if (accept == 0) {
-		return 0;
-	} else {
-		return changed + 1;
-	}
-}
+#endif
 
 drawvec stairstep(drawvec &geom, int z, int detail) {
 	drawvec out;
 	double scale = 1 << (32 - detail - z);
 
 	for (size_t i = 0; i < geom.size(); i++) {
-		geom[i].x = std::floor(geom[i].x / scale);
-		geom[i].y = std::floor(geom[i].y / scale);
+		geom[i].x = std::round(geom[i].x / scale);
+		geom[i].y = std::round(geom[i].y / scale);
 	}
 
 	for (size_t i = 0; i < geom.size(); i++) {
@@ -1211,13 +895,485 @@ drawvec stairstep(drawvec &geom, int z, int detail) {
 			// out.push_back(draw(VT_LINETO, xx, yy));
 		} else {
 			fprintf(stderr, "Can't happen: stairstepping lineto with no moveto\n");
-			exit(EXIT_FAILURE);
+			exit(EXIT_IMPOSSIBLE);
 		}
 	}
 
 	for (size_t i = 0; i < out.size(); i++) {
 		out[i].x *= 1 << (32 - detail - z);
 		out[i].y *= 1 << (32 - detail - z);
+	}
+
+	return out;
+}
+
+// https://github.com/Turfjs/turf/blob/master/packages/turf-center-of-mass/index.ts
+//
+// The MIT License (MIT)
+//
+// Copyright (c) 2019 Morgan Herlocker
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy of
+// this software and associated documentation files (the "Software"), to deal in
+// the Software without restriction, including without limitation the rights to
+// use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of
+// the Software, and to permit persons to whom the Software is furnished to do so,
+// subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in all
+// copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS
+// FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR
+// COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
+// IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+// CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+draw centerOfMass(const drawvec &dv, size_t start, size_t end, draw centre) {
+	std::vector<draw> coords;
+	for (size_t i = start; i < end; i++) {
+		coords.push_back(dv[i]);
+	}
+
+	// First, we neutralize the feature (set it around coordinates [0,0]) to prevent rounding errors
+	// We take any point to translate all the points around 0
+	draw translation = centre;
+	double sx = 0;
+	double sy = 0;
+	double sArea = 0;
+	draw pi, pj;
+	double xi, xj, yi, yj, a;
+
+	std::vector<draw> neutralizedPoints;
+	for (size_t i = 0; i < coords.size(); i++) {
+		neutralizedPoints.push_back(draw(coords[i].op, coords[i].x - translation.x, coords[i].y - translation.y));
+	}
+
+	for (size_t i = 0; i < coords.size() - 1; i++) {
+		// pi is the current point
+		pi = neutralizedPoints[i];
+		xi = pi.x;
+		yi = pi.y;
+
+		// pj is the next point (pi+1)
+		pj = neutralizedPoints[i + 1];
+		xj = pj.x;
+		yj = pj.y;
+
+		// a is the common factor to compute the signed area and the final coordinates
+		a = xi * yj - xj * yi;
+
+		// sArea is the sum used to compute the signed area
+		sArea += a;
+
+		// sx and sy are the sums used to compute the final coordinates
+		sx += (xi + xj) * a;
+		sy += (yi + yj) * a;
+	}
+
+	// Shape has no area: fallback on turf.centroid
+	if (sArea == 0) {
+		return centre;
+	} else {
+		// Compute the signed area, and factorize 1/6A
+		double area = sArea * 0.5;
+		double areaFactor = 1 / (6 * area);
+
+		// Compute the final coordinates, adding back the values that have been neutralized
+		return draw(VT_MOVETO, translation.x + areaFactor * sx, translation.y + areaFactor * sy);
+	}
+}
+
+double label_goodness(const drawvec &dv, long long x, long long y) {
+	int nesting = 0;
+
+	for (size_t i = 0; i < dv.size(); i++) {
+		if (dv[i].op == VT_MOVETO) {
+			size_t j;
+			for (j = i + 1; j < dv.size(); j++) {
+				if (dv[j].op != VT_LINETO) {
+					break;
+				}
+			}
+
+			// if it's inside the ring, and it's an outer ring,
+			// we are nested more; if it's an inner ring, we are
+			// nested less.
+			if (pnpoly(dv, i, j - i, x, y)) {
+				if (get_area(dv, i, j) >= 0) {
+					nesting++;
+				} else {
+					nesting--;
+				}
+			}
+
+			i = j - 1;
+		}
+	}
+
+	if (nesting < 1) {
+		return 0;  // outside the polygon is as bad as it gets
+	}
+
+	double closest = INFINITY;  // closest distance to the border
+
+	for (size_t i = 0; i < dv.size(); i++) {
+		double dx = dv[i].x - x;
+		double dy = dv[i].y - y;
+		double dist = sqrt(dx * dx + dy * dy);
+		if (dist < closest) {
+			closest = dist;
+		}
+
+		if (i > 0 && dv[i].op == VT_LINETO) {
+			dist = distance_from_line(x, y, dv[i - 1].x, dv[i - 1].y, dv[i].x, dv[i].y);
+			if (dist < closest) {
+				closest = dist;
+			}
+		}
+	}
+
+	return closest;
+}
+
+struct sorty {
+	long long x;
+	long long y;
+};
+
+struct sorty_sorter {
+	int kind;
+	sorty_sorter(int k)
+	    : kind(k){};
+
+	bool operator()(const sorty &a, const sorty &b) const {
+		long long xa, ya, xb, yb;
+
+		if (kind == 0) {  // Y first
+			xa = a.x;
+			ya = a.y;
+
+			xb = b.x;
+			yb = b.y;
+		} else if (kind == 1) {	 // X first
+			xa = a.y;
+			ya = a.x;
+
+			xb = b.y;
+			yb = b.x;
+		} else if (kind == 2) {	 // diagonal
+			xa = a.x + a.y;
+			ya = a.x - a.y;
+
+			xb = b.x + b.y;
+			yb = b.x - b.y;
+		} else {  // other diagonal
+			xa = a.x - a.y;
+			ya = a.x + a.y;
+
+			xb = b.x - b.y;
+			yb = b.x + b.y;
+		}
+
+		if (ya < yb) {
+			return true;
+		} else if (ya == yb && xa < xb) {
+			return true;
+		} else {
+			return false;
+		}
+	};
+};
+
+struct candidate {
+	long long x;
+	long long y;
+	double dist;
+
+	bool operator<(const candidate &c) const {
+		// largest distance sorts first
+		return dist > c.dist;
+	};
+};
+
+// Generate a label point for a polygon feature.
+//
+// A good label point will be near the center of the feature and far from any border.
+//
+// Polylabel is supposed to be able to do this optimally, but can be quite slow
+// and sometimes still produces some odd results.
+//
+// The centroid is often off-center because edges with many curves will be
+// weighted higher than edges with straight lines.
+//
+// Turf's center-of-mass algorithm generally does a good job, but can sometimes
+// find a point that is outside the bounds of the polygon or quite close to the edge.
+//
+// So prefer the center of mass, but if it produces something too close to the border
+// or outside the polygon, try a series of gridded points within the feature's bounding box
+// until something works well, or if nothing does after several iterations, use the
+// least-bad option.
+
+drawvec polygon_to_anchor(const drawvec &geom) {
+	size_t start = 0, end = 0;
+	size_t best_area = 0;
+	std::vector<sorty> points;
+
+	// find the largest outer ring, which will be the best thing
+	// to label if we can do it.
+
+	for (size_t i = 0; i < geom.size(); i++) {
+		if (geom[i].op == VT_MOVETO) {
+			size_t j;
+			for (j = i + 1; j < geom.size(); j++) {
+				if (geom[j].op != VT_LINETO) {
+					break;
+				}
+
+				sorty sy;
+				sy.x = geom[j].x;
+				sy.y = geom[j].y;
+				points.push_back(sy);
+			}
+
+			double area = get_area(geom, i, j);
+			if (area > best_area) {
+				start = i;
+				end = j;
+				best_area = area;
+			}
+
+			i = j - 1;
+		}
+	}
+
+	// If there are no outer rings, don't generate a label point
+
+	if (best_area > 0) {
+		long long xsum = 0;
+		long long ysum = 0;
+		size_t count = 0;
+		long long xmin = LLONG_MAX, ymin = LLONG_MAX, xmax = LLONG_MIN, ymax = LLONG_MIN;
+
+		// Calculate centroid and bounding box of biggest ring.
+		// start + 1 to exclude the first point, which is duplicated as the last
+		for (size_t k = start + 1; k < end; k++) {
+			xsum += geom[k].x;
+			ysum += geom[k].y;
+			count++;
+
+			xmin = std::min(xmin, geom[k].x);
+			ymin = std::min(ymin, geom[k].y);
+			xmax = std::max(xmax, geom[k].x);
+			ymax = std::max(ymax, geom[k].y);
+		}
+
+		if (count > 0) {
+			// We want label points that are at least a moderate distance from
+			// the edge of the feature. The threshold for what is too close
+			// is derived from the area of the feature.
+
+			double radius = sqrt(best_area / M_PI);
+			double goodness_threshold = radius / 5;
+
+			// First choice: Turf's center of mass.
+
+			draw centroid(VT_MOVETO, xsum / count, ysum / count);
+			draw d = centerOfMass(geom, start, end, centroid);
+			double goodness = label_goodness(geom, d.x, d.y);
+			const char *kind = "mass";
+
+			if (goodness < goodness_threshold) {
+				// Label is too close to the border or outside it,
+				// so try some other possible points. Sort the vertices
+				// both by Y and X coordinate and then by diagonals,
+				// and walk through each set
+				// in sorted order. Adjacent pairs of coordinates should
+				// tend to bounce back and forth between rings, so the
+				// midpoint of each pair will hopefully be somewhere in the
+				// interior of the polygon.
+
+				std::vector<candidate> candidates;
+
+				for (size_t pass = 0; pass < 4; pass++) {
+					std::stable_sort(points.begin(), points.end(), sorty_sorter(pass));
+
+					for (size_t i = 1; i < points.size(); i++) {
+						double dx = points[i].x - points[i - 1].x;
+						double dy = points[i].y - points[i - 1].y;
+
+						double dist = sqrt(dx * dx + dy * dy);
+						if (dist > 2 * goodness_threshold) {
+							candidate c;
+
+							c.x = (points[i].x + points[i - 1].x) / 2;
+							c.y = (points[i].y + points[i - 1].y) / 2;
+							c.dist = dist;
+
+							candidates.push_back(c);
+						}
+					}
+				}
+
+				// Now sort the accumulate list of segment midpoints by the lengths
+				// of the segments. Starting from the longest
+				// segment, if we find one whose midpoint is inside the polygon and
+				// far enough from any edge to be good enough, stop looking.
+
+				std::stable_sort(candidates.begin(), candidates.end());
+				// only check the top 50 stride midpoints, since this list can be quite large
+				for (size_t i = 0; i < candidates.size() && i < 50; i++) {
+					double maybe_goodness = label_goodness(geom, candidates[i].x, candidates[i].y);
+
+					if (maybe_goodness > goodness) {
+						d.x = candidates[i].x;
+						d.y = candidates[i].y;
+
+						goodness = maybe_goodness;
+						kind = "diagonal";
+						if (goodness > goodness_threshold) {
+							break;
+						}
+					}
+				}
+			}
+
+			// We may still not have anything decent, so the next thing to look at
+			// is points from gridding the bounding box of the largest ring.
+
+			if (goodness < goodness_threshold) {
+				for (long long sub = 2;
+				     sub < 32 && (xmax - xmin) > 2 * sub && (ymax - ymin) > 2 * sub;
+				     sub *= 2) {
+					for (long long x = 1; x < sub; x++) {
+						for (long long y = 1; y < sub; y++) {
+							draw maybe(VT_MOVETO,
+								   xmin + x * (xmax - xmin) / sub,
+								   ymin + y * (ymax - ymin) / sub);
+
+							double maybe_goodness = label_goodness(geom, maybe.x, maybe.y);
+							if (maybe_goodness > goodness) {
+								// better than the previous
+								d = maybe;
+								goodness = maybe_goodness;
+								kind = "grid";
+							}
+						}
+					}
+
+					if (goodness > goodness_threshold) {
+						break;
+					}
+				}
+
+				// There is nothing really good. Is the centroid maybe better?
+				// If not, we're stuck with whatever the best we found was.
+				double maybe_goodness = label_goodness(geom, centroid.x, centroid.y);
+				if (maybe_goodness > goodness) {
+					d = centroid;
+					goodness = maybe_goodness;
+					kind = "centroid";
+				}
+
+				if (goodness <= 0) {
+					double lon, lat;
+					tile2lonlat(d.x, d.y, 32, &lon, &lat);
+
+					static std::atomic<long long> warned(0);
+					if (warned++ < 10) {
+						fprintf(stderr, "could not find good label point: %s %f,%f\n", kind, lat, lon);
+					}
+				}
+			}
+
+			drawvec dv;
+			dv.push_back(d);
+			return dv;
+		}
+	}
+
+	return drawvec();
+}
+
+drawvec checkerboard_anchors(drawvec const &geom, int tx, int ty, int z, unsigned long long label_point) {
+	drawvec out;
+
+	// anchor point in world coordinates
+	unsigned wx, wy;
+	decode_index(label_point, &wx, &wy);
+
+	// upper left of tile in world coordinates
+	long long tx1 = 0, ty1 = 0;
+	// lower right of tile in world coordinates;
+	long long tx2 = 1LL << 32;  // , ty2 = 1LL << 32;
+	if (z != 0) {
+		tx1 = (long long) tx << (32 - z);
+		ty1 = (long long) ty << (32 - z);
+
+		tx2 = (long long) (tx + 1) << (32 - z);
+		// ty2 = (long long) (ty + 1) << (32 - z);
+	}
+
+	// upper left of feature in world coordinates
+	long long bx1 = LLONG_MAX, by1 = LLONG_MAX;
+	// lower right of feature in world coordinates;
+	long long bx2 = LLONG_MIN, by2 = LLONG_MIN;
+
+	for (auto const &g : geom) {
+		bx1 = std::min(bx1, g.x + tx1);
+		by1 = std::min(by1, g.y + ty1);
+
+		bx2 = std::max(bx2, g.x + tx1);
+		by2 = std::max(by2, g.y + ty1);
+	}
+
+	if (bx1 > bx2 || by1 > by2) {
+		return out;
+	}
+
+	// labels repeat every 0.3 tiles at z0
+	double spiral_dist = 0.3;
+	if (z > 0) {
+		// only every ~6 tiles by the time we get to z15
+		spiral_dist = spiral_dist * exp(log(z) * 1.2);
+	}
+
+	const long long label_spacing = spiral_dist * (tx2 - tx1);
+
+	long long x1 = floor(std::min(bx1 - wx, bx2 - wx) / label_spacing);
+	long long x2 = ceil(std::max(bx1 - wx, bx2 - wx) / label_spacing);
+
+	long long y1 = floor(std::min(by1 - wy, by2 - wy) / label_spacing - 0.5);
+	long long y2 = ceil(std::max(by1 - wy, by2 - wy) / label_spacing);
+
+	for (long long lx = x1; lx <= x2; lx++) {
+		for (long long ly = y1; ly <= y2; ly++) {
+			long long x = lx * label_spacing + wx;
+			long long y = ly * label_spacing + wy;
+
+			if (((unsigned long long) lx & 1) == 1) {
+				y += label_spacing / 2;
+			}
+
+			if (x < bx1 || x > bx2 || y < by1 || y > by2) {
+				continue;
+			}
+
+			// If it's the central label, it's the best we've got,
+			// so accept it in any case. If it's from the outer spiral,
+			// don't use it if it's too close to a border.
+			if (lx == 0 && ly == 0) {
+				out.push_back(draw(VT_MOVETO, x - tx1, y - ty1));
+				break;
+			} else {
+				double tilesize = 1LL << (32 - z);
+				double goodness_threshold = tilesize / 100;
+				if (label_goodness(geom, x - tx1, y - ty1) > goodness_threshold) {
+					out.push_back(draw(VT_MOVETO, x - tx1, y - ty1));
+					break;
+				}
+			}
+		}
 	}
 
 	return out;

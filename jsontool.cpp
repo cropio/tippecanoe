@@ -11,6 +11,8 @@
 #include "csv.hpp"
 #include "text.hpp"
 #include "geojson-loop.hpp"
+#include "milo/dtoa_milo.h"
+#include "errors.hpp"
 
 int fail = EXIT_SUCCESS;
 bool wrap = false;
@@ -111,8 +113,8 @@ std::string sort_quote(const char *s) {
 
 	for (size_t i = 0; i < utf32.size(); i++) {
 		if (utf32[i] < 0xD800) {
-			char buf[7];
-			sprintf(buf, "\\u%04lu", utf32[i]);
+			char buf[8];
+			snprintf(buf, sizeof(buf), "\\u%04lu", utf32[i]);
 			ret.append(std::string(buf));
 		} else {
 			unsigned long c = utf32[i];
@@ -147,7 +149,7 @@ void out(std::string const &s, int type, json_object *properties) {
 		if (o != NULL) {
 			found = true;
 			if (o->type == JSON_STRING || o->type == JSON_NUMBER) {
-				extracted = sort_quote(o->string);
+				extracted = sort_quote(o->value.string.string);
 			} else {
 				// Don't really know what to do about sort quoting
 				// for arbitrary objects
@@ -197,7 +199,7 @@ void out(std::string const &s, int type, json_object *properties) {
 
 	if (type != buffered_type) {
 		fprintf(stderr, "Error: mix of bare geometries and features\n");
-		exit(EXIT_FAILURE);
+		exit(EXIT_IMPOSSIBLE);
 	}
 }
 
@@ -208,13 +210,13 @@ void join_csv(json_object *j) {
 		std::string s = csv_getline(csvfile);
 		if (s.size() == 0) {
 			fprintf(stderr, "Couldn't get column header from CSV file\n");
-			exit(EXIT_FAILURE);
+			exit(EXIT_CSV);
 		}
 
 		std::string err = check_utf8(s);
 		if (err != "") {
 			fprintf(stderr, "%s\n", err.c_str());
-			exit(EXIT_FAILURE);
+			exit(EXIT_UTF8);
 		}
 
 		header = csv_split(s.c_str());
@@ -225,7 +227,7 @@ void join_csv(json_object *j) {
 
 		if (header.size() == 0) {
 			fprintf(stderr, "No columns in CSV header \"%s\"\n", s.c_str());
-			exit(EXIT_FAILURE);
+			exit(EXIT_CSV);
 		}
 	}
 
@@ -246,8 +248,10 @@ void join_csv(json_object *j) {
 	}
 
 	std::string joinkey;
-	if (key->type == JSON_STRING || key->type == JSON_NUMBER) {
-		joinkey = key->string;
+	if (key->type == JSON_STRING) {
+		joinkey = key->value.string.string;
+	} else if (key->type == JSON_NUMBER) {
+		joinkey = milo::dtoa_milo(key->value.number.number);
 	} else {
 		const char *s = json_stringify(key);
 		joinkey = s;
@@ -256,7 +260,7 @@ void join_csv(json_object *j) {
 
 	if (joinkey < prev_joinkey) {
 		fprintf(stderr, "GeoJSON file is out of sort: \"%s\" follows \"%s\"\n", joinkey.c_str(), prev_joinkey.c_str());
-		exit(EXIT_FAILURE);
+		exit(EXIT_IMPOSSIBLE);
 	}
 	prev_joinkey = joinkey;
 
@@ -276,7 +280,7 @@ void join_csv(json_object *j) {
 			std::string err = check_utf8(s);
 			if (err != "") {
 				fprintf(stderr, "%s\n", err.c_str());
-				exit(EXIT_FAILURE);
+				exit(EXIT_UTF8);
 			}
 
 			fields = csv_split(s.c_str());
@@ -287,7 +291,7 @@ void join_csv(json_object *j) {
 
 			if (fields.size() > 0 && fields[0] < prevkey) {
 				fprintf(stderr, "CSV file is out of sort: \"%s\" follows \"%s\"\n", fields[0].c_str(), prevkey.c_str());
-				exit(EXIT_FAILURE);
+				exit(EXIT_CSV);
 			}
 
 			if (fields.size() > 0 && fields[0] >= joinkey) {
@@ -302,11 +306,12 @@ void join_csv(json_object *j) {
 
 	if (fields.size() > 0 && joinkey == fields[0]) {
 		// This knows more about the structure of JSON objects than it ought to
-		properties->keys = (json_object **) realloc((void *) properties->keys, (properties->length + 32 + fields.size()) * sizeof(json_object *));
-		properties->values = (json_object **) realloc((void *) properties->values, (properties->length + 32 + fields.size()) * sizeof(json_object *));
-		if (properties->keys == NULL || properties->values == NULL) {
+		// The 8 is to round up at least as much as SIZE_FOR in json_pull.c
+		properties->value.object.keys = (json_object **) realloc((void *) properties->value.object.keys, (properties->value.object.length + 8 + fields.size()) * sizeof(json_object *));
+		properties->value.object.values = (json_object **) realloc((void *) properties->value.object.values, (properties->value.object.length + 8 + fields.size()) * sizeof(json_object *));
+		if (properties->value.object.keys == NULL || properties->value.object.values == NULL) {
 			perror("realloc");
-			exit(EXIT_FAILURE);
+			exit(EXIT_MEMORY);
 		}
 
 		for (size_t i = 1; i < fields.size(); i++) {
@@ -331,33 +336,40 @@ void join_csv(json_object *j) {
 				json_object *vo = (json_object *) malloc(sizeof(json_object));
 				if (ko == NULL || vo == NULL) {
 					perror("malloc");
-					exit(EXIT_FAILURE);
+					exit(EXIT_MEMORY);
 				}
 
 				ko->type = JSON_STRING;
-				vo->type = attr_type;
+				ko->parent = properties;
+				ko->parser = properties->parser;
 
-				ko->parent = vo->parent = properties;
-				ko->array = vo->array = NULL;
-				ko->keys = vo->keys = NULL;
-				ko->values = vo->values = NULL;
-				ko->parser = vo->parser = properties->parser;
-
-				ko->string = strdup(k.c_str());
-				vo->string = strdup(v.c_str());
-
-				if (ko->string == NULL || vo->string == NULL) {
+				ko->value.string.string = strdup(k.c_str());
+				if (ko->value.string.string == NULL) {
 					perror("strdup");
-					exit(EXIT_FAILURE);
+					exit(EXIT_MEMORY);
 				}
 
-				ko->length = strlen(ko->string);
-				vo->length = strlen(vo->string);
-				vo->number = atof(vo->string);
+				vo->type = attr_type;
+				vo->parent = properties;
+				vo->parser = properties->parser;
 
-				properties->keys[properties->length] = ko;
-				properties->values[properties->length] = vo;
-				properties->length++;
+				if (attr_type == JSON_STRING) {
+					vo->value.string.string = strdup(v.c_str());
+					if (vo->value.string.string == NULL) {
+						perror("strdup");
+						exit(EXIT_MEMORY);
+					}
+				} else if (attr_type == JSON_NUMBER) {
+					vo->value.number.number = atof(v.c_str());
+					vo->value.number.large_unsigned = 0;
+					vo->value.number.large_signed = 0;
+				} else {
+					abort();
+				}
+
+				properties->value.object.keys[properties->value.object.length] = ko;
+				properties->value.object.values[properties->value.object.length] = vo;
+				properties->value.object.length++;
 			}
 		}
 	}
@@ -447,26 +459,26 @@ int main(int argc, char **argv) {
 				pe = true;
 			} else {
 				fprintf(stderr, "%s: Unknown option for -p%s\n", argv[0], optarg);
-				exit(EXIT_FAILURE);
+				exit(EXIT_ARGS);
 			}
 			break;
 
 		default:
 			fprintf(stderr, "Unexpected option -%c\n", i);
-			exit(EXIT_FAILURE);
+			exit(EXIT_ARGS);
 		}
 	}
 
 	if (extract != NULL && wrap) {
 		fprintf(stderr, "%s: --wrap and --extract not supported together\n", argv[0]);
-		exit(EXIT_FAILURE);
+		exit(EXIT_ARGS);
 	}
 
 	if (csv != NULL) {
 		csvfile = fopen(csv, "r");
 		if (csvfile == NULL) {
 			perror(csv);
-			exit(EXIT_FAILURE);
+			exit(EXIT_OPEN);
 		}
 	}
 
@@ -477,7 +489,7 @@ int main(int argc, char **argv) {
 			FILE *f = fopen(argv[i], "r");
 			if (f == NULL) {
 				perror(argv[i]);
-				exit(EXIT_FAILURE);
+				exit(EXIT_OPEN);
 			}
 
 			process(f, argv[i]);
@@ -494,7 +506,7 @@ int main(int argc, char **argv) {
 	if (csvfile != NULL) {
 		if (fclose(csvfile) != 0) {
 			perror("close");
-			exit(EXIT_FAILURE);
+			exit(EXIT_CLOSE);
 		}
 	}
 

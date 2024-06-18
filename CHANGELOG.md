@@ -1,3 +1,360 @@
+# 2.55.0
+
+* Fix hash collisions in the string pool
+
+# 2.53.0
+
+* Stop trying to add features to the tile after the feature limit is reached
+
+# 2.52.0
+
+* Fix accidental loss (at all zooms) of features that specify an explicit minzoom
+
+# 2.51.0
+
+* Fix null behavior in "in" expressions
+* But they are back to not using unidecode
+
+# 2.50.0
+
+* FSL-style "in" expressions use unidecode again
+
+# 2.49.0
+
+* FSL-style "in" expressions now allow numeric comparisons, but they no longer use unidecode to remove diacritics.
+
+# 2.48.0
+
+* Fix some undefined behavior bugs, one of which results in slight changes to line simplification choices
+
+# 2.47.0
+
+* Stabilize feature order in tippecanoe-overzoom when --preserve-feature-order is specified but the sequence attribute is not present
+
+# 2.46.0
+
+* Polygon dust returns to having the attributes of the contributing feature nearest the placeholder instead of the contributing feature with the largest area.
+
+# 2.45.0
+
+* Adjust tile size limit with --retain-points-multiplier dynamically within each tile, to allow multiplier features at high zooms if other features are being dropped as-needed
+
+# 2.44.0
+
+* Add --unidecode-data option to allow case-insensitive filter comparisons of transliterated strings
+
+# 2.43.0
+
+* Change -fraction-as-needed feature dropping to be consistent across tiles and zoom levels, and to follow the same pattern as point dropping by zoom level
+* With -as-needed feature dropping, drop or retain entire multiplier clusters instead of individual features
+* Sort the features within each multiplier cluster by its retention priority, for more consistency between zoom levels in filtered feature choice
+
+# 2.42.0
+
+* Improve tiling speed
+* Generate tilestats for the --retain-points-multiplier attributes
+
+# 2.41.3
+
+* Performance optimizations to tile reading, writing, and overzooming
+* Automatically vary the tile size limit by zoom level to match the intended retain-points-multiplier multiplication
+* Fix decompression error when bailing out because a tile can't be made small enough
+* Search harder for a feature size threshold to make the tile small enough before giving up
+
+# 2.41.2
+
+* Add --accumulate-attribute to tippecanoe-overzoom
+* Go back to ordering features within each multiplier cluster spatially, not in the order specified for tile feature order
+
+# 2.41.1
+
+* Make --preserve-input-order, --order-by, --order-descending-by, --order-smallest-first, and --order-largest-first cooperate with --retain-points-multiplier. The clusters will be ordered by their lead feature in the specified sequence. The other features in each cluster will continue to be physically near the lead feature, but ordered as specified within the cluster.
+
+# 2.41.0
+
+* Add Felt-style expression support for -j feature filters
+* Add --retain-points-multiplier option
+* Add tippecanoe_decisions metadata field to record basezoom, drop rate, and multiplier
+* Add multiplier thinning (-m) and feature filters (-j) to tippecanoe-overzoom
+
+# 2.40.0
+
+* Slightly reduce compression aggressiveness to improve as-needed dropping speed
+
+# 2.39.0
+
+* Reduce memory usage during tiling
+
+# 2.38.0
+
+* Tolerate polygon rings with insuffiently many points in input
+
+# 2.37.1
+
+* Reduce maximum memory used for vertex sorting
+
+# 2.37.0
+
+* Speed up tile-join overzooming and make it use less memory, by not including empty child tiles in the enumeration
+
+# 2.36.0
+
+* Make tile-join distrust the source tilesets' metadata maxzoom and minzoom
+* Add a special case in --detect-longitude-wraparound not to wrap around jumps of exactly 360°
+
+# 2.35.0
+
+* Fix a bug in --detect-longitude-wraparound when there are multiple rings
+
+# 2.34.1
+
+* Further improvements to tile-join speed
+
+# 2.34.0
+
+* Improve speed of overzooming in tile-join
+
+# 2.33.0
+
+* Further reduce memory usage of --no-simplification-of-shared-nodes by calculating the list of shared nodes globally using temporary files rather than in memory for each individual tile
+* Make --no-simplification-of-shared-nodes behave for LineStrings as it does for Polygons, preventing simplification only at crossings, convergences, and divergences, not at every point along collinear segments
+
+# 2.32.1
+
+* Reduce memory usage of --no-simplification-of-shared-nodes for polygons
+
+# 2.32.0
+
+* Extend --no-simplification-of-shared-nodes to also simplify shared polygon borders consistently
+
+# 2.31.0
+
+* Fix tile-join crash when trying to join empty tilesets
+* Add --no-tiny-polygon-reduction-at-maximum-zoom option
+
+# 2.30.1
+
+* Fix spurious reports of tiny polygons and 0-length LineStrings in "strategies"
+
+# 2.30.0
+
+* Add --extend-zooms-if-still-dropping-maximum option
+* Add --overzoom option to tile-join
+
+# 2.29.0
+
+* Add tippecanoe-overzoom tool
+
+# 2.28.1
+
+* Allow --set-attribute to override an existing attribute value
+
+# 2.28.0
+
+* Add --preserve-point-density-threshold option to reduce blank areas of the map at low zooms
+* Fix tile-join bug where use of --read-from would also accidentally enable --quiet
+
+# 2.27.0
+
+* Do more of line simplification in integer coordinates, to make behavior consistent across platforms
+* Reduce excessive logging during pmtiles conversion
+* Add --set-attribute option
+* Accept JSON form of --accumulate-attribute
+
+# 2.26.1
+
+* Avoid crashing if there is a polygon ring with only one point
+
+# 2.26.0
+
+* Fix bugs in --no-simplification-of-shared-nodes
+* Updated dockerfile (jtmiclat)
+* Set build options to use C++-17 (james2432)
+* Use std::fpclassify instead of plain fpclassify (james)
+* Fix pmtiles warnings (bdon)
+
+# 2.25.0
+
+* Add `--include`/`-y` option to tile-join
+
+# 2.24.0
+
+* Add --cluster-maxzoom option to limit zoom levels that receive clustering
+* Add `point_count_abbreviated` attribute to clustered features, for consistency with supercluster
+* Makefile changes to support FreeBSD
+* Add -r option to tile-join to provide a file containing a list of input files
+* Add antimeridian_adjusted_bounds field to tileset metadata
+
+## 2.23.0
+
+* Remove the concept of "separate metadata." Features now always directly reference their keys and values rather than going through a second level of indirection.
+* Limit the size of the string pool to 1/5 the size of memory, to prevent thrashing during feature ingestion.
+* Avoid using writeable memory maps. Instead, explicitly copy data in and out of memory.
+* Compress streams of features in the temporary files, to reduce disk usage and I/O latency
+
+## 2.22.0
+
+* Speed up feature dropping by removing unnecessary search for other small features
+
+## 2.21.0
+
+* Improve label placement to avoid placing labels in polygon holes
+
+## 2.20.0
+
+* Round coordinates instead of truncating them, for better precision when overzooming
+
+## 2.19.0
+
+* Don't guess an excessively large maxzoom when there is only one feature
+* Set the base zoom for -Bg as part of the --smallest-maximum-zoom-guess logic
+
+## 2.18.0
+
+* Fix crash when using tile-join to join an empty pmtiles tileset
+
+## 2.17.0
+
+* Add pmtiles output format
+
+## 2.16.0
+
+* During tiling, limit the size of the statistics that are kept for -as-needed calculations, because they can get quite large for sources with hundreds of millions of features.
+
+## 2.15.2
+
+* Change tile hash function to fnv1a
+* Report JSON object context on the same line as the error message
+
+## 2.15.1
+
+* Correct mbtiles inserts to use text instead of blob
+* Add an internal data structure to represent tileset metadata
+
+## 2.15.0
+
+* Generate label points in a more straightforward checkerboard, and fewer of them at high zoom levels.
+
+## 2.14.0
+
+* Don't preflight each zoom level if one of the as-needed options is specified. Instead, go ahead and write out the tiles, and then clear out the zoom level for another try if necessary.
+
+## 2.13.1
+
+* Simplify geometry earlier when the in-memory representation of a tile gets large, to reduce peak memory usage
+
+## 2.13.0
+
+* Add --limit-tile-feature-count and --limit-tile-feature-count-at-maximum-zoom
+* Coalesce small features only onto other small features with `--coalesce-smallest-as-needed`, never to large features
+* Clean coalesced-as-needed features before simplifying them, to improve simplification quality
+
+## 2.12.0
+
+* Add `--drop-denser` option to drop points in dense clusters in preference
+  to those in sparse areas.
+
+## 2.11.0
+
+* Change sqlite3 schema to deduplicate identical tiles
+* Limit guessed maxzoom to avoid spending too many tiles on polygon fill
+
+## 2.10.0
+
+* Upgrade flatbuffers version
+
+## 2.9.1
+
+* Do label generation after simplification, not before.
+
+## 2.9.0
+
+* Add an option to generate label points in place of polygons
+* Add --order-smallest-first and --order-largest-first options
+* When tiny polygons are being aggregated into dust, keep the attributes of the largest.
+
+## 2.8.1
+
+* Improve precision of polygon ring area calculations
+
+## 2.8.0
+
+* Add the option to use a different simplification level at maxzoom
+
+## 2.7.0
+
+* Add the option to use the Visvalingam simplification algorithm
+
+## 2.6.4
+
+* Update tests that should have been updated in 2.6.2
+
+## 2.6.3
+
+* Fix crash in tile-join caused by wrong-way comparison
+
+## 2.6.2
+
+* Stop adding features to a tile if it can't possibly work, to limit memory use
+* Add --integer and --fraction options to tippecanoe-decode
+* Carry `strategies` field from tileset metadata through tile-join
+
+## 2.6.1
+
+* Upgrade protozero to version 1.7.1
+
+## 2.6.0
+
+* Add another drop rate guessing options, from the same metrics -zg uses
+* Reduce maxzooms being guessed a little:
+  * Use 1.5 standard deviations, not 2, as the minimum distinguishable
+  * Give overlapping polygons and linestrings more distinct indices
+
+## 2.5.0
+
+* Add an option to add extra detail at maxzoom that does not factor into guessing
+* Restore the intended behavior that tiny polygons don't get further simplified
+* Add an option to use single-precision floating point in tiles
+* Improve polygon simplification by choosing a better start/end point
+* Sort attribute values in tiles to make them compress a little better
+* Fix dropping of "largest" points when there are duplicate points
+* Add an option to prevent guessing a basezoom higher than the maxzoom
+* Add --order-by and --order-descending options
+
+## 2.4.1
+
+* Accept tilestats limiting options in tile-join, not just tippecanoe
+
+## 2.4.0
+
+* Change maxzoom guessing to take into account the standard deviation of the distances between features, so data with tight clusters will choose a higher maxzoom
+
+## 2.3.2
+
+* Add --smallest-maximum-zoom-guess to guess maxzoom starting at some minimum
+
+## 2.3.1
+
+* Track the desired tile size (the maximum size if no features were dropped) in each zoom level too.
+
+## 2.3.0
+
+* Drop and coalesce points too as part of smallest-as-needed dropping and coalescing
+* Keep statistics in the tileset metadata of what tile size reduction strategies were used at each zoom level
+
+## 2.2.0
+
+* Reduce memory consumption when parsing large JSON objects
+* Don't exit with an error if free disk space can't be determined
+
+## 2.1.0
+
+* Add barebones support for FlatGeobuf input files
+
+## 2.0.0
+
+* Fork of [mapbox/tippecanoe 1.36.0](https://github.com/mapbox/tippecanoe/tree/1.36.0) to http://github.com/protomaps/tippecanoe
+
 ## 1.36.0
 
 * Update Wagyu to version 0.5.0

@@ -34,7 +34,7 @@
 #include <map>
 #include <cmath>
 
-#ifdef __APPLE__
+#if defined(__APPLE__) || defined(__FreeBSD__)
 #include <sys/types.h>
 #include <sys/sysctl.h>
 #include <sys/param.h>
@@ -45,6 +45,7 @@
 
 #include "jsonpull/jsonpull.h"
 #include "mbtiles.hpp"
+#include "pmtiles_file.hpp"
 #include "tile.hpp"
 #include "pool.hpp"
 #include "projection.hpp"
@@ -53,6 +54,7 @@
 #include "main.hpp"
 #include "geojson.hpp"
 #include "geobuf.hpp"
+#include "flatgeobuf.hpp"
 #include "geocsv.hpp"
 #include "geometry.hpp"
 #include "serial.hpp"
@@ -61,22 +63,44 @@
 #include "dirtiles.hpp"
 #include "evaluator.hpp"
 #include "text.hpp"
+#include "errors.hpp"
+#include "read_json.hpp"
+#include "sort.hpp"
+#include "attribute.hpp"
+#include "thread.hpp"
 
 static int low_detail = 12;
 static int full_detail = -1;
 static int min_detail = 7;
+int extra_detail = -1;
 
 int quiet = 0;
 int quiet_progress = 0;
+json_logger logger;
 double progress_interval = 0;
 std::atomic<double> last_progress(0);
 int geometry_scale = 0;
 double simplification = 1;
+double maxzoom_simplification = -1;
 size_t max_tile_size = 500000;
 size_t max_tile_features = 200000;
 int cluster_distance = 0;
+int tiny_polygon_size = 2;
+int cluster_maxzoom = MAX_ZOOM;
 long justx = -1, justy = -1;
 std::string attribute_for_id = "";
+size_t limit_tile_feature_count = 0;
+size_t limit_tile_feature_count_at_maxzoom = 0;
+unsigned int drop_denser = 0;
+std::map<std::string, serial_val> set_attributes;
+unsigned long long preserve_point_density_threshold = 0;
+long long extend_zooms_max = 0;
+int retain_points_multiplier = 1;
+std::vector<std::string> unidecode_data;
+
+std::vector<order_field> order_by;
+bool order_reverse;
+bool order_by_size = false;
 
 int prevent[256];
 int additional[256];
@@ -91,6 +115,7 @@ struct source {
 size_t CPUS;
 size_t TEMP_FILES;
 long long MAX_FILES;
+size_t memsize;
 static long long diskfree;
 char **av;
 
@@ -99,9 +124,10 @@ std::vector<clipbbox> clipbboxes;
 void checkdisk(std::vector<struct reader> *r) {
 	long long used = 0;
 	for (size_t i = 0; i < r->size(); i++) {
-		// Meta, pool, and tree are used once.
+		// Pool and tree are used once.
 		// Geometry and index will be duplicated during sorting and tiling.
-		used += (*r)[i].metapos + 2 * (*r)[i].geompos + 2 * (*r)[i].indexpos + (*r)[i].poolfile->len + (*r)[i].treefile->len;
+		used += 2 * (*r)[i].geompos + 2 * (*r)[i].indexpos + (*r)[i].poolfile->off + (*r)[i].treefile->off +
+			(*r)[i].vertexpos + (*r)[i].nodepos;
 	}
 
 	static int warned = 0;
@@ -115,12 +141,12 @@ int atoi_require(const char *s, const char *what) {
 	char *err = NULL;
 	if (*s == '\0') {
 		fprintf(stderr, "%s: %s must be a number (got %s)\n", *av, what, s);
-		exit(EXIT_FAILURE);
+		exit(EXIT_ARGS);
 	}
 	int ret = strtol(s, &err, 10);
 	if (*err != '\0') {
 		fprintf(stderr, "%s: %s must be a number (got %s)\n", *av, what, s);
-		exit(EXIT_FAILURE);
+		exit(EXIT_ARGS);
 	}
 	return ret;
 }
@@ -129,12 +155,12 @@ double atof_require(const char *s, const char *what) {
 	char *err = NULL;
 	if (*s == '\0') {
 		fprintf(stderr, "%s: %s must be a number (got %s)\n", *av, what, s);
-		exit(EXIT_FAILURE);
+		exit(EXIT_ARGS);
 	}
 	double ret = strtod(s, &err);
 	if (*err != '\0') {
 		fprintf(stderr, "%s: %s must be a number (got %s)\n", *av, what, s);
-		exit(EXIT_FAILURE);
+		exit(EXIT_ARGS);
 	}
 	return ret;
 }
@@ -143,12 +169,12 @@ long long atoll_require(const char *s, const char *what) {
 	char *err = NULL;
 	if (*s == '\0') {
 		fprintf(stderr, "%s: %s must be a number (got %s)\n", *av, what, s);
-		exit(EXIT_FAILURE);
+		exit(EXIT_ARGS);
 	}
 	long long ret = strtoll(s, &err, 10);
 	if (*err != '\0') {
 		fprintf(stderr, "%s: %s must be a number (got %s)\n", *av, what, s);
-		exit(EXIT_FAILURE);
+		exit(EXIT_ARGS);
 	}
 	return ret;
 }
@@ -177,7 +203,7 @@ void init_cpus() {
 	struct rlimit rl;
 	if (getrlimit(RLIMIT_NOFILE, &rl) != 0) {
 		perror("getrlimit");
-		exit(EXIT_FAILURE);
+		exit(EXIT_PTHREAD);
 	} else {
 		MAX_FILES = rl.rlim_cur;
 	}
@@ -203,7 +229,7 @@ void init_cpus() {
 	for (j = 0; j < i; j++) {
 		if (close(fds[j]) < 0) {
 			perror("close");
-			exit(EXIT_FAILURE);
+			exit(EXIT_CLOSE);
 		}
 	}
 
@@ -211,7 +237,7 @@ void init_cpus() {
 	MAX_FILES = i * 3 / 4;
 	if (MAX_FILES < 32) {
 		fprintf(stderr, "Can't open a useful number of files: %lld\n", MAX_FILES);
-		exit(EXIT_FAILURE);
+		exit(EXIT_OPEN);
 	}
 
 	TEMP_FILES = (MAX_FILES - 10) / 2;
@@ -259,17 +285,21 @@ struct drop_state {
 	double gap;
 	unsigned long long previndex;
 	double interval;
-	double scale;
-	double seq;
-	long long included;
-	unsigned x;
-	unsigned y;
+	double seq;  // floating point because interval is
+};
+
+struct drop_densest {
+	unsigned long long gap;
+	size_t seq;
+
+	bool operator<(const drop_densest &o) const {
+		// largest gap sorts first
+		return gap > o.gap;
+	}
 };
 
 int calc_feature_minzoom(struct index *ix, struct drop_state *ds, int maxzoom, double gamma) {
 	int feature_minzoom = 0;
-	unsigned xx, yy;
-	decode_index(ix->ix, &xx, &yy);
 
 	if (gamma >= 0 && (ix->t == VT_POINT ||
 			   (additional[A_LINE_DROP] && ix->t == VT_LINE) ||
@@ -278,12 +308,40 @@ int calc_feature_minzoom(struct index *ix, struct drop_state *ds, int maxzoom, d
 			ds[i].seq++;
 		}
 		for (ssize_t i = maxzoom; i >= 0; i--) {
-			if (ds[i].seq >= 0) {
-				ds[i].seq -= ds[i].interval;
-				ds[i].included++;
-			} else {
+			if (ds[i].seq < 0) {
 				feature_minzoom = i + 1;
+
+				// The feature we are pushing out
+				// appears in zooms i + 1 through maxzoom,
+				// so track where that was so we can make sure
+				// not to cluster something else that is *too*
+				// far away into it.
+				for (ssize_t j = i + 1; j <= maxzoom; j++) {
+					ds[j].previndex = ix->ix;
+				}
+
 				break;
+			} else {
+				ds[i].seq -= ds[i].interval;
+			}
+		}
+
+		// If this feature has been chosen only for a high zoom level,
+		// check whether at a low zoom level it is nevertheless too far
+		// from the last feature chosen for that low zoom, in which case
+		// we will go ahead and push it out.
+
+		if (preserve_point_density_threshold > 0) {
+			for (ssize_t i = 0; i < feature_minzoom && i < maxzoom; i++) {
+				if (ix->ix - ds[i].previndex > ((1LL << (32 - i)) / preserve_point_density_threshold) * ((1LL << (32 - i)) / preserve_point_density_threshold)) {
+					feature_minzoom = i;
+
+					for (ssize_t j = i; j <= maxzoom; j++) {
+						ds[j].previndex = ix->ix;
+					}
+
+					break;
+				}
 			}
 		}
 
@@ -307,8 +365,11 @@ static void merge(struct mergelist *merges, size_t nmerges, unsigned char *map, 
 	while (head != NULL) {
 		struct index ix = *((struct index *) (map + head->start));
 		long long pos = *geompos;
-		fwrite_check(geom_map + ix.start, 1, ix.end - ix.start, geom_out, "merge geometry");
-		*geompos += ix.end - ix.start;
+
+		// MAGIC: This knows that the feature minzoom is the last byte of the serialized feature
+		// and is writing one byte less and then adding the byte for the minzoom.
+
+		fwrite_check(geom_map + ix.start, 1, ix.end - ix.start - 1, geom_out, geompos, "merge geometry");
 		int feature_minzoom = calc_feature_minzoom(&ix, ds, maxzoom, gamma);
 		serialize_byte(geom_out, feature_minzoom, geompos, "merge geometry");
 
@@ -316,12 +377,14 @@ static void merge(struct mergelist *merges, size_t nmerges, unsigned char *map, 
 		*progress += (ix.end - ix.start) * 3 / 4;
 		if (!quiet && !quiet_progress && progress_time() && 100 * *progress / *progress_max != *progress_reported) {
 			fprintf(stderr, "Reordering geometry: %lld%% \r", 100 * *progress / *progress_max);
+			fflush(stderr);
 			*progress_reported = 100 * *progress / *progress_max;
 		}
 
 		ix.start = pos;
 		ix.end = *geompos;
-		fwrite_check(&ix, bytes, 1, indexfile, "merge temporary");
+		std::atomic<long long> indexpos;
+		fwrite_check(&ix, bytes, 1, indexfile, &indexpos, "merge temporary");
 		head->start += bytes;
 
 		struct mergelist *m = head;
@@ -363,38 +426,31 @@ void *run_sort(void *v) {
 		a->merges[start / a->unit].end = end;
 		a->merges[start / a->unit].next = NULL;
 
-		// MAP_PRIVATE to avoid disk writes if it fits in memory
-		void *map = mmap(NULL, end - start, PROT_READ | PROT_WRITE, MAP_PRIVATE, a->indexfd, start);
-		if (map == MAP_FAILED) {
-			perror("mmap in run_sort");
-			exit(EXIT_FAILURE);
+		// Read section of index into memory to sort and then use pwrite()
+		// to write it back out rather than sorting in mapped memory,
+		// because writable mapped memory seems to have bad performance
+		// problems on ECS (and maybe in containers in general)?
+
+		std::string s;
+		s.resize(end - start);
+
+		if (pread(a->indexfd, (void *) s.c_str(), end - start, start) != end - start) {
+			fprintf(stderr, "pread(index): %s\n", strerror(errno));
+			exit(EXIT_READ);
 		}
-		madvise(map, end - start, MADV_RANDOM);
-		madvise(map, end - start, MADV_WILLNEED);
 
-		qsort(map, (end - start) / a->bytes, a->bytes, indexcmp);
+		qsort((void *) s.c_str(), (end - start) / a->bytes, a->bytes, indexcmp);
 
-		// Sorting and then copying avoids disk access to
-		// write out intermediate stages of the sort.
-
-		void *map2 = mmap(NULL, end - start, PROT_READ | PROT_WRITE, MAP_SHARED, a->indexfd, start);
-		if (map2 == MAP_FAILED) {
-			perror("mmap (write)");
-			exit(EXIT_FAILURE);
+		if (pwrite(a->indexfd, s.c_str(), end - start, start) != end - start) {
+			fprintf(stderr, "pwrite(index): %s\n", strerror(errno));
+			exit(EXIT_WRITE);
 		}
-		madvise(map2, end - start, MADV_SEQUENTIAL);
-
-		memcpy(map2, map, end - start);
-
-		// No madvise, since caller will want the sorted data
-		munmap(map, end - start);
-		munmap(map2, end - start);
 	}
 
 	return NULL;
 }
 
-void do_read_parallel(char *map, long long len, long long initial_offset, const char *reading, std::vector<struct reader> *readers, std::atomic<long long> *progress_seq, std::set<std::string> *exclude, std::set<std::string> *include, int exclude_all, int basezoom, int source, std::vector<std::map<std::string, layermap_entry> > *layermaps, int *initialized, unsigned *initial_x, unsigned *initial_y, int maxzoom, std::string layername, bool uses_gamma, std::map<std::string, int> const *attribute_types, int separator, double *dist_sum, size_t *dist_count, bool want_dist, bool filters) {
+void do_read_parallel(char *map, long long len, long long initial_offset, const char *reading, std::vector<struct reader> *readers, std::atomic<long long> *progress_seq, std::set<std::string> *exclude, std::set<std::string> *include, int exclude_all, int basezoom, int source, std::vector<std::map<std::string, layermap_entry> > *layermaps, int *initialized, unsigned *initial_x, unsigned *initial_y, int maxzoom, std::string layername, bool uses_gamma, std::unordered_map<std::string, int> const *attribute_types, int separator, double *dist_sum, size_t *dist_count, double *area_sum, bool want_dist, bool filters) {
 	long long segs[CPUS + 1];
 	segs[0] = 0;
 	segs[CPUS] = len;
@@ -409,6 +465,7 @@ void do_read_parallel(char *map, long long len, long long initial_offset, const 
 
 	double dist_sums[CPUS];
 	size_t dist_counts[CPUS];
+	double area_sums[CPUS];
 
 	std::atomic<long long> layer_seq[CPUS];
 	for (size_t i = 0; i < CPUS; i++) {
@@ -416,6 +473,7 @@ void do_read_parallel(char *map, long long len, long long initial_offset, const 
 		// begins with that segment's offset into the input
 		layer_seq[i] = segs[i] + initial_offset;
 		dist_sums[i] = dist_counts[i] = 0;
+		area_sums[i] = 0;
 	}
 
 	std::vector<parse_json_args> pja;
@@ -424,10 +482,10 @@ void do_read_parallel(char *map, long long len, long long initial_offset, const 
 	sst.resize(CPUS);
 
 	pthread_t pthreads[CPUS];
-	std::vector<std::set<type_and_string> > file_subkeys;
+	std::vector<std::set<serial_val> > file_subkeys;
 
 	for (size_t i = 0; i < CPUS; i++) {
-		file_subkeys.push_back(std::set<type_and_string>());
+		file_subkeys.push_back(std::set<serial_val>());
 	}
 
 	for (size_t i = 0; i < CPUS; i++) {
@@ -441,6 +499,7 @@ void do_read_parallel(char *map, long long len, long long initial_offset, const 
 		sst[i].initial_x = &initial_x[i];
 		sst[i].initial_y = &initial_y[i];
 		sst[i].dist_sum = &(dist_sums[i]);
+		sst[i].area_sum = &(area_sums[i]);
 		sst[i].dist_count = &(dist_counts[i]);
 		sst[i].want_dist = want_dist;
 		sst[i].maxzoom = maxzoom;
@@ -461,9 +520,9 @@ void do_read_parallel(char *map, long long len, long long initial_offset, const 
 	}
 
 	for (size_t i = 0; i < CPUS; i++) {
-		if (pthread_create(&pthreads[i], NULL, run_parse_json, &pja[i]) != 0) {
+		if (thread_create(&pthreads[i], NULL, run_parse_json, &pja[i]) != 0) {
 			perror("pthread_create");
-			exit(EXIT_FAILURE);
+			exit(EXIT_PTHREAD);
 		}
 	}
 
@@ -476,6 +535,7 @@ void do_read_parallel(char *map, long long len, long long initial_offset, const 
 
 		*dist_sum += dist_sums[i];
 		*dist_count += dist_counts[i];
+		*area_sum += area_sums[i];
 
 		json_end_map(pja[i].jp);
 	}
@@ -521,7 +581,7 @@ struct STREAM {
 			int ret = gzread(gz, out, count);
 			if (ret < 0) {
 				fprintf(stderr, "%s: Error reading compressed data\n", *av);
-				exit(EXIT_FAILURE);
+				exit(EXIT_READ);
 			}
 			return ret;
 		} else {
@@ -547,13 +607,13 @@ STREAM *streamfdopen(int fd, const char *mode, std::string const &fname) {
 		s->gz = gzdopen(fd, mode);
 		if (s->gz == NULL) {
 			fprintf(stderr, "%s: %s: Decompression error\n", *av, fname.c_str());
-			exit(EXIT_FAILURE);
+			exit(EXIT_OPEN);
 		}
 	} else {
 		s->fp = fdopen(fd, mode);
 		if (s->fp == NULL) {
 			perror(fname.c_str());
-			exit(EXIT_FAILURE);
+			exit(EXIT_OPEN);
 		}
 	}
 
@@ -591,9 +651,10 @@ struct read_parallel_arg {
 	unsigned *initial_y = NULL;
 	std::string layername = "";
 	bool uses_gamma = false;
-	std::map<std::string, int> const *attribute_types = NULL;
+	std::unordered_map<std::string, int> const *attribute_types = NULL;
 	double *dist_sum = NULL;
 	size_t *dist_count = NULL;
+	double *area_sum = NULL;
 	bool want_dist = false;
 	bool filters = false;
 };
@@ -613,11 +674,11 @@ void *run_read_parallel(void *v) {
 	char *map = (char *) mmap(NULL, rpa->len, PROT_READ, MAP_PRIVATE, rpa->fd, 0);
 	if (map == NULL || map == MAP_FAILED) {
 		perror("map intermediate input");
-		exit(EXIT_FAILURE);
+		exit(EXIT_MEMORY);
 	}
 	madvise(map, rpa->len, MADV_RANDOM);  // sequential, but from several pointers at once
 
-	do_read_parallel(map, rpa->len, rpa->offset, rpa->reading, rpa->readers, rpa->progress_seq, rpa->exclude, rpa->include, rpa->exclude_all, rpa->basezoom, rpa->source, rpa->layermaps, rpa->initialized, rpa->initial_x, rpa->initial_y, rpa->maxzoom, rpa->layername, rpa->uses_gamma, rpa->attribute_types, rpa->separator, rpa->dist_sum, rpa->dist_count, rpa->want_dist, rpa->filters);
+	do_read_parallel(map, rpa->len, rpa->offset, rpa->reading, rpa->readers, rpa->progress_seq, rpa->exclude, rpa->include, rpa->exclude_all, rpa->basezoom, rpa->source, rpa->layermaps, rpa->initialized, rpa->initial_x, rpa->initial_y, rpa->maxzoom, rpa->layername, rpa->uses_gamma, rpa->attribute_types, rpa->separator, rpa->dist_sum, rpa->dist_count, rpa->area_sum, rpa->want_dist, rpa->filters);
 
 	madvise(map, rpa->len, MADV_DONTNEED);
 	if (munmap(map, rpa->len) != 0) {
@@ -625,7 +686,7 @@ void *run_read_parallel(void *v) {
 	}
 	if (rpa->fp->fclose() != 0) {
 		perror("close source file");
-		exit(EXIT_FAILURE);
+		exit(EXIT_CLOSE);
 	}
 
 	*(rpa->is_parsing) = 0;
@@ -634,7 +695,7 @@ void *run_read_parallel(void *v) {
 	return NULL;
 }
 
-void start_parsing(int fd, STREAM *fp, long long offset, long long len, std::atomic<int> *is_parsing, pthread_t *parallel_parser, bool &parser_created, const char *reading, std::vector<struct reader> *readers, std::atomic<long long> *progress_seq, std::set<std::string> *exclude, std::set<std::string> *include, int exclude_all, int basezoom, int source, std::vector<std::map<std::string, layermap_entry> > &layermaps, int *initialized, unsigned *initial_x, unsigned *initial_y, int maxzoom, std::string layername, bool uses_gamma, std::map<std::string, int> const *attribute_types, int separator, double *dist_sum, size_t *dist_count, bool want_dist, bool filters) {
+void start_parsing(int fd, STREAM *fp, long long offset, long long len, std::atomic<int> *is_parsing, pthread_t *parallel_parser, bool &parser_created, const char *reading, std::vector<struct reader> *readers, std::atomic<long long> *progress_seq, std::set<std::string> *exclude, std::set<std::string> *include, int exclude_all, int basezoom, int source, std::vector<std::map<std::string, layermap_entry> > &layermaps, int *initialized, unsigned *initial_x, unsigned *initial_y, int maxzoom, std::string layername, bool uses_gamma, std::unordered_map<std::string, int> const *attribute_types, int separator, double *dist_sum, size_t *dist_count, double *area_sum, bool want_dist, bool filters) {
 	// This has to kick off an intermediate thread to start the parser threads,
 	// so the main thread can get back to reading the next input stage while
 	// the intermediate thread waits for the completion of the parser threads.
@@ -644,7 +705,7 @@ void start_parsing(int fd, STREAM *fp, long long offset, long long len, std::ato
 	struct read_parallel_arg *rpa = new struct read_parallel_arg;
 	if (rpa == NULL) {
 		perror("Out of memory");
-		exit(EXIT_FAILURE);
+		exit(EXIT_MEMORY);
 	}
 
 	rpa->fd = fd;
@@ -672,12 +733,13 @@ void start_parsing(int fd, STREAM *fp, long long offset, long long len, std::ato
 	rpa->attribute_types = attribute_types;
 	rpa->dist_sum = dist_sum;
 	rpa->dist_count = dist_count;
+	rpa->area_sum = area_sum;
 	rpa->want_dist = want_dist;
 	rpa->filters = filters;
 
-	if (pthread_create(parallel_parser, NULL, run_read_parallel, rpa) != 0) {
+	if (thread_create(parallel_parser, NULL, run_read_parallel, rpa) != 0) {
 		perror("pthread_create");
-		exit(EXIT_FAILURE);
+		exit(EXIT_PTHREAD);
 	}
 	parser_created = true;
 }
@@ -698,30 +760,30 @@ void radix1(int *geomfds_in, int *indexfds_in, int inputs, int prefix, int split
 		sub_geompos[i] = 0;
 
 		char geomname[strlen(tmpdir) + strlen("/geom.XXXXXXXX") + 1];
-		sprintf(geomname, "%s%s", tmpdir, "/geom.XXXXXXXX");
+		snprintf(geomname, sizeof(geomname), "%s%s", tmpdir, "/geom.XXXXXXXX");
 		char indexname[strlen(tmpdir) + strlen("/index.XXXXXXXX") + 1];
-		sprintf(indexname, "%s%s", tmpdir, "/index.XXXXXXXX");
+		snprintf(indexname, sizeof(indexname), "%s%s", tmpdir, "/index.XXXXXXXX");
 
 		geomfds[i] = mkstemp_cloexec(geomname);
 		if (geomfds[i] < 0) {
 			perror(geomname);
-			exit(EXIT_FAILURE);
+			exit(EXIT_OPEN);
 		}
 		indexfds[i] = mkstemp_cloexec(indexname);
 		if (indexfds[i] < 0) {
 			perror(indexname);
-			exit(EXIT_FAILURE);
+			exit(EXIT_OPEN);
 		}
 
 		geomfiles[i] = fopen_oflag(geomname, "wb", O_WRONLY | O_CLOEXEC);
 		if (geomfiles[i] == NULL) {
 			perror(geomname);
-			exit(EXIT_FAILURE);
+			exit(EXIT_OPEN);
 		}
 		indexfiles[i] = fopen_oflag(indexname, "wb", O_WRONLY | O_CLOEXEC);
 		if (indexfiles[i] == NULL) {
 			perror(indexname);
-			exit(EXIT_FAILURE);
+			exit(EXIT_OPEN);
 		}
 
 		*availfiles -= 4;
@@ -734,11 +796,11 @@ void radix1(int *geomfds_in, int *indexfds_in, int inputs, int prefix, int split
 		struct stat geomst, indexst;
 		if (fstat(geomfds_in[i], &geomst) < 0) {
 			perror("stat geom");
-			exit(EXIT_FAILURE);
+			exit(EXIT_STAT);
 		}
 		if (fstat(indexfds_in[i], &indexst) < 0) {
 			perror("stat index");
-			exit(EXIT_FAILURE);
+			exit(EXIT_STAT);
 		}
 
 		if (indexst.st_size != 0) {
@@ -746,14 +808,14 @@ void radix1(int *geomfds_in, int *indexfds_in, int inputs, int prefix, int split
 			if (indexmap == MAP_FAILED) {
 				fprintf(stderr, "fd %lld, len %lld\n", (long long) indexfds_in[i], (long long) indexst.st_size);
 				perror("map index");
-				exit(EXIT_FAILURE);
+				exit(EXIT_STAT);
 			}
 			madvise(indexmap, indexst.st_size, MADV_SEQUENTIAL);
 			madvise(indexmap, indexst.st_size, MADV_WILLNEED);
 			char *geommap = (char *) mmap(NULL, geomst.st_size, PROT_READ, MAP_PRIVATE, geomfds_in[i], 0);
 			if (geommap == MAP_FAILED) {
 				perror("map geom");
-				exit(EXIT_FAILURE);
+				exit(EXIT_MEMORY);
 			}
 			madvise(geommap, geomst.st_size, MADV_SEQUENTIAL);
 			madvise(geommap, geomst.st_size, MADV_WILLNEED);
@@ -763,41 +825,42 @@ void radix1(int *geomfds_in, int *indexfds_in, int inputs, int prefix, int split
 				unsigned long long which = (ix.ix << prefix) >> (64 - splitbits);
 				long long pos = sub_geompos[which];
 
-				fwrite_check(geommap + ix.start, ix.end - ix.start, 1, geomfiles[which], "geom");
-				sub_geompos[which] += ix.end - ix.start;
+				fwrite_check(geommap + ix.start, ix.end - ix.start, 1, geomfiles[which], &sub_geompos[which], "geom");
 
 				// Count this as a 25%-accomplishment, since we will copy again
 				*progress += (ix.end - ix.start) / 4;
 				if (!quiet && !quiet_progress && progress_time() && 100 * *progress / *progress_max != *progress_reported) {
 					fprintf(stderr, "Reordering geometry: %lld%% \r", 100 * *progress / *progress_max);
+					fflush(stderr);
 					*progress_reported = 100 * *progress / *progress_max;
 				}
 
 				ix.start = pos;
 				ix.end = sub_geompos[which];
 
-				fwrite_check(&ix, sizeof(struct index), 1, indexfiles[which], "index");
+				std::atomic<long long> indexpos;
+				fwrite_check(&ix, sizeof(struct index), 1, indexfiles[which], &indexpos, "index");
 			}
 
 			madvise(indexmap, indexst.st_size, MADV_DONTNEED);
 			if (munmap(indexmap, indexst.st_size) < 0) {
 				perror("unmap index");
-				exit(EXIT_FAILURE);
+				exit(EXIT_MEMORY);
 			}
 			madvise(geommap, geomst.st_size, MADV_DONTNEED);
 			if (munmap(geommap, geomst.st_size) < 0) {
 				perror("unmap geom");
-				exit(EXIT_FAILURE);
+				exit(EXIT_MEMORY);
 			}
 		}
 
 		if (close(geomfds_in[i]) < 0) {
 			perror("close geom");
-			exit(EXIT_FAILURE);
+			exit(EXIT_CLOSE);
 		}
 		if (close(indexfds_in[i]) < 0) {
 			perror("close index");
-			exit(EXIT_FAILURE);
+			exit(EXIT_CLOSE);
 		}
 
 		*availfiles += 2;
@@ -806,11 +869,11 @@ void radix1(int *geomfds_in, int *indexfds_in, int inputs, int prefix, int split
 	for (i = 0; i < splits; i++) {
 		if (fclose(geomfiles[i]) != 0) {
 			perror("fclose geom");
-			exit(EXIT_FAILURE);
+			exit(EXIT_CLOSE);
 		}
 		if (fclose(indexfiles[i]) != 0) {
 			perror("fclose index");
-			exit(EXIT_FAILURE);
+			exit(EXIT_CLOSE);
 		}
 
 		*availfiles += 2;
@@ -822,11 +885,11 @@ void radix1(int *geomfds_in, int *indexfds_in, int inputs, int prefix, int split
 		struct stat geomst, indexst;
 		if (fstat(geomfds[i], &geomst) < 0) {
 			perror("stat geom");
-			exit(EXIT_FAILURE);
+			exit(EXIT_STAT);
 		}
 		if (fstat(indexfds[i], &indexst) < 0) {
 			perror("stat index");
-			exit(EXIT_FAILURE);
+			exit(EXIT_STAT);
 		}
 
 		if (indexst.st_size > 0) {
@@ -870,9 +933,9 @@ void radix1(int *geomfds_in, int *indexfds_in, int inputs, int prefix, int split
 				}
 
 				for (size_t a = 0; a < CPUS; a++) {
-					if (pthread_create(&pthreads[a], NULL, run_sort, &args[a]) != 0) {
+					if (thread_create(&pthreads[a], NULL, run_sort, &args[a]) != 0) {
 						perror("pthread_create");
-						exit(EXIT_FAILURE);
+						exit(EXIT_PTHREAD);
 					}
 				}
 
@@ -888,14 +951,14 @@ void radix1(int *geomfds_in, int *indexfds_in, int inputs, int prefix, int split
 				if (indexmap == MAP_FAILED) {
 					fprintf(stderr, "fd %lld, len %lld\n", (long long) indexfds[i], (long long) indexst.st_size);
 					perror("map index");
-					exit(EXIT_FAILURE);
+					exit(EXIT_MEMORY);
 				}
 				madvise(indexmap, indexst.st_size, MADV_RANDOM);  // sequential, but from several pointers at once
 				madvise(indexmap, indexst.st_size, MADV_WILLNEED);
 				char *geommap = (char *) mmap(NULL, geomst.st_size, PROT_READ, MAP_PRIVATE, geomfds[i], 0);
 				if (geommap == MAP_FAILED) {
 					perror("map geom");
-					exit(EXIT_FAILURE);
+					exit(EXIT_MEMORY);
 				}
 				madvise(geommap, geomst.st_size, MADV_RANDOM);
 				madvise(geommap, geomst.st_size, MADV_WILLNEED);
@@ -905,26 +968,26 @@ void radix1(int *geomfds_in, int *indexfds_in, int inputs, int prefix, int split
 				madvise(indexmap, indexst.st_size, MADV_DONTNEED);
 				if (munmap(indexmap, indexst.st_size) < 0) {
 					perror("unmap index");
-					exit(EXIT_FAILURE);
+					exit(EXIT_MEMORY);
 				}
 				madvise(geommap, geomst.st_size, MADV_DONTNEED);
 				if (munmap(geommap, geomst.st_size) < 0) {
 					perror("unmap geom");
-					exit(EXIT_FAILURE);
+					exit(EXIT_MEMORY);
 				}
 			} else if (indexst.st_size == sizeof(struct index) || prefix + splitbits >= 64) {
 				struct index *indexmap = (struct index *) mmap(NULL, indexst.st_size, PROT_READ, MAP_PRIVATE, indexfds[i], 0);
 				if (indexmap == MAP_FAILED) {
 					fprintf(stderr, "fd %lld, len %lld\n", (long long) indexfds[i], (long long) indexst.st_size);
 					perror("map index");
-					exit(EXIT_FAILURE);
+					exit(EXIT_MEMORY);
 				}
 				madvise(indexmap, indexst.st_size, MADV_SEQUENTIAL);
 				madvise(indexmap, indexst.st_size, MADV_WILLNEED);
 				char *geommap = (char *) mmap(NULL, geomst.st_size, PROT_READ, MAP_PRIVATE, geomfds[i], 0);
 				if (geommap == MAP_FAILED) {
 					perror("map geom");
-					exit(EXIT_FAILURE);
+					exit(EXIT_MEMORY);
 				}
 				madvise(geommap, geomst.st_size, MADV_RANDOM);
 				madvise(geommap, geomst.st_size, MADV_WILLNEED);
@@ -933,8 +996,7 @@ void radix1(int *geomfds_in, int *indexfds_in, int inputs, int prefix, int split
 					struct index ix = indexmap[a];
 					long long pos = *geompos_out;
 
-					fwrite_check(geommap + ix.start, ix.end - ix.start, 1, geomfile, "geom");
-					*geompos_out += ix.end - ix.start;
+					fwrite_check(geommap + ix.start, ix.end - ix.start, 1, geomfile, geompos_out, "geom");
 					int feature_minzoom = calc_feature_minzoom(&ix, ds, maxzoom, gamma);
 					serialize_byte(geomfile, feature_minzoom, geompos_out, "merge geometry");
 
@@ -942,23 +1004,25 @@ void radix1(int *geomfds_in, int *indexfds_in, int inputs, int prefix, int split
 					*progress += (ix.end - ix.start) * 3 / 4;
 					if (!quiet && !quiet_progress && progress_time() && 100 * *progress / *progress_max != *progress_reported) {
 						fprintf(stderr, "Reordering geometry: %lld%% \r", 100 * *progress / *progress_max);
+						fflush(stderr);
 						*progress_reported = 100 * *progress / *progress_max;
 					}
 
 					ix.start = pos;
 					ix.end = *geompos_out;
-					fwrite_check(&ix, sizeof(struct index), 1, indexfile, "index");
+					std::atomic<long long> indexpos;
+					fwrite_check(&ix, sizeof(struct index), 1, indexfile, &indexpos, "index");
 				}
 
 				madvise(indexmap, indexst.st_size, MADV_DONTNEED);
 				if (munmap(indexmap, indexst.st_size) < 0) {
 					perror("unmap index");
-					exit(EXIT_FAILURE);
+					exit(EXIT_MEMORY);
 				}
 				madvise(geommap, geomst.st_size, MADV_DONTNEED);
 				if (munmap(geommap, geomst.st_size) < 0) {
 					perror("unmap geom");
-					exit(EXIT_FAILURE);
+					exit(EXIT_MEMORY);
 				}
 			} else {
 				// We already reported the progress from splitting this radix out
@@ -976,11 +1040,11 @@ void radix1(int *geomfds_in, int *indexfds_in, int inputs, int prefix, int split
 		if (!already_closed) {
 			if (close(geomfds[i]) < 0) {
 				perror("close geom");
-				exit(EXIT_FAILURE);
+				exit(EXIT_CLOSE);
 			}
 			if (close(indexfds[i]) < 0) {
 				perror("close index");
-				exit(EXIT_FAILURE);
+				exit(EXIT_CLOSE);
 			}
 
 			*availfiles += 2;
@@ -999,12 +1063,33 @@ void prep_drop_states(struct drop_state *ds, int maxzoom, int basezoom, double d
 			ds[i].interval = std::exp(std::log(droprate) * (basezoom - i));
 		}
 
-		ds[i].scale = (double) (1LL << (64 - 2 * (i + 8)));
 		ds[i].seq = 0;
-		ds[i].included = 0;
-		ds[i].x = 0;
-		ds[i].y = 0;
 	}
+}
+
+static size_t calc_memsize() {
+	size_t mem;
+
+#ifdef __APPLE__
+	int64_t hw_memsize;
+	size_t len = sizeof(int64_t);
+	if (sysctlbyname("hw.memsize", &hw_memsize, &len, NULL, 0) < 0) {
+		perror("sysctl hw.memsize");
+		exit(EXIT_MEMORY);
+	}
+	mem = hw_memsize;
+#else
+	long long pagesize = sysconf(_SC_PAGESIZE);
+	long long pages = sysconf(_SC_PHYS_PAGES);
+	if (pages < 0 || pagesize < 0) {
+		perror("sysconf _SC_PAGESIZE or _SC_PHYS_PAGES");
+		exit(EXIT_MEMORY);
+	}
+
+	mem = (long long) pages * pagesize;
+#endif
+
+	return mem;
 }
 
 void radix(std::vector<struct reader> &readers, int nreaders, FILE *geomfile, FILE *indexfile, const char *tmpdir, std::atomic<long long> *geompos, int maxzoom, int basezoom, double droprate, double gamma) {
@@ -1017,26 +1102,7 @@ void radix(std::vector<struct reader> &readers, int nreaders, FILE *geomfile, FI
 
 	// Then concatenate each of the sub-outputs into a final output.
 
-	long long mem;
-
-#ifdef __APPLE__
-	int64_t hw_memsize;
-	size_t len = sizeof(int64_t);
-	if (sysctlbyname("hw.memsize", &hw_memsize, &len, NULL, 0) < 0) {
-		perror("sysctl hw.memsize");
-		exit(EXIT_FAILURE);
-	}
-	mem = hw_memsize;
-#else
-	long long pagesize = sysconf(_SC_PAGESIZE);
-	long long pages = sysconf(_SC_PHYS_PAGES);
-	if (pages < 0 || pagesize < 0) {
-		perror("sysconf _SC_PAGESIZE or _SC_PHYS_PAGES");
-		exit(EXIT_FAILURE);
-	}
-
-	mem = (long long) pages * pagesize;
-#endif
+	long long mem = memsize;
 
 	// Just for code coverage testing. Deeply recursive sorting is very slow
 	// compared to sorting in memory.
@@ -1044,8 +1110,8 @@ void radix(std::vector<struct reader> &readers, int nreaders, FILE *geomfile, FI
 		mem = 8192;
 	}
 
-	long long availfiles = MAX_FILES - 2 * nreaders  // each reader has a geom and an index
-			       - 4			 // pool, meta, mbtiles, mbtiles journal
+	long long availfiles = MAX_FILES - 2 * nreaders	 // each reader has a geom and an index
+			       - 3			 // pool, mbtiles, mbtiles journal
 			       - 4			 // top-level geom and index output, both FILE and fd
 			       - 3;			 // stdin, stdout, stderr
 
@@ -1066,7 +1132,7 @@ void radix(std::vector<struct reader> &readers, int nreaders, FILE *geomfile, FI
 		struct stat geomst;
 		if (fstat(readers[i].geomfd, &geomst) < 0) {
 			perror("stat geom");
-			exit(EXIT_FAILURE);
+			exit(EXIT_STAT);
 		}
 		geom_total += geomst.st_size;
 	}
@@ -1080,11 +1146,11 @@ void radix(std::vector<struct reader> &readers, int nreaders, FILE *geomfile, FI
 
 	if (availfiles - 2 * nreaders != availfiles_before) {
 		fprintf(stderr, "Internal error: miscounted available file descriptors: %lld vs %lld\n", availfiles - 2 * nreaders, availfiles);
-		exit(EXIT_FAILURE);
+		exit(EXIT_IMPOSSIBLE);
 	}
 }
 
-void choose_first_zoom(long long *file_bbox, std::vector<struct reader> &readers, unsigned *iz, unsigned *ix, unsigned *iy, int minzoom, int buffer) {
+void choose_first_zoom(long long *file_bbox, long long *file_bbox1, long long *file_bbox2, std::vector<struct reader> &readers, unsigned *iz, unsigned *ix, unsigned *iy, int minzoom, int buffer) {
 	for (size_t i = 0; i < CPUS; i++) {
 		if (readers[i].file_bbox[0] < file_bbox[0]) {
 			file_bbox[0] = readers[i].file_bbox[0];
@@ -1098,6 +1164,16 @@ void choose_first_zoom(long long *file_bbox, std::vector<struct reader> &readers
 		if (readers[i].file_bbox[3] > file_bbox[3]) {
 			file_bbox[3] = readers[i].file_bbox[3];
 		}
+
+		file_bbox1[0] = std::min(file_bbox1[0], readers[i].file_bbox1[0]);
+		file_bbox1[1] = std::min(file_bbox1[1], readers[i].file_bbox1[1]);
+		file_bbox1[2] = std::max(file_bbox1[2], readers[i].file_bbox1[2]);
+		file_bbox1[3] = std::max(file_bbox1[3], readers[i].file_bbox1[3]);
+
+		file_bbox2[0] = std::min(file_bbox2[0], readers[i].file_bbox2[0]);
+		file_bbox2[1] = std::min(file_bbox2[1], readers[i].file_bbox2[1]);
+		file_bbox2[2] = std::max(file_bbox2[2], readers[i].file_bbox2[2]);
+		file_bbox2[3] = std::max(file_bbox2[3], readers[i].file_bbox2[3]);
 	}
 
 	// If the bounding box extends off the plane on either side,
@@ -1135,7 +1211,35 @@ void choose_first_zoom(long long *file_bbox, std::vector<struct reader> &readers
 	}
 }
 
-int read_input(std::vector<source> &sources, char *fname, int maxzoom, int minzoom, int basezoom, double basezoom_marker_width, sqlite3 *outdb, const char *outdir, std::set<std::string> *exclude, std::set<std::string> *include, int exclude_all, json_object *filter, double droprate, int buffer, const char *tmpdir, double gamma, int read_parallel, int forcetable, const char *attribution, bool uses_gamma, long long *file_bbox, const char *prefilter, const char *postfilter, const char *description, bool guess_maxzoom, std::map<std::string, int> const *attribute_types, const char *pgm, std::map<std::string, attribute_op> const *attribute_accum, std::map<std::string, std::string> const &attribute_descriptions, std::string const &commandline, double *persent) {
+int vertexcmp(const void *void1, const void *void2) {
+	vertex *v1 = (vertex *) void1;
+	vertex *v2 = (vertex *) void2;
+
+	if (v1->mid < v2->mid) {
+		return -1;
+	}
+	if (v1->mid > v2->mid) {
+		return 1;
+	}
+
+	if (v1->p1 < v2->p1) {
+		return -1;
+	}
+	if (v1->p1 > v2->p1) {
+		return 1;
+	}
+
+	if (v1->p2 < v2->p2) {
+		return -1;
+	}
+	if (v1->p2 > v2->p2) {
+		return 1;
+	}
+
+	return 0;
+}
+
+std::pair<int, metadata> read_input(std::vector<source> &sources, char *fname, int maxzoom, int minzoom, int basezoom, double basezoom_marker_width, sqlite3 *outdb, const char *outdir, std::set<std::string> *exclude, std::set<std::string> *include, int exclude_all, json_object *filter, double droprate, int buffer, const char *tmpdir, double gamma, int read_parallel, int forcetable, const char *attribution, bool uses_gamma, long long *file_bbox, long long *file_bbox1, long long *file_bbox2, const char *prefilter, const char *postfilter, const char *description, bool guess_maxzoom, bool guess_cluster_maxzoom, std::unordered_map<std::string, int> const *attribute_types, const char *pgm, std::unordered_map<std::string, attribute_op> const *attribute_accum, std::map<std::string, std::string> const &attribute_descriptions, std::string const &commandline, int minimum_maxzoom) {
 	int ret = EXIT_SUCCESS;
 
 	std::vector<struct reader> readers;
@@ -1143,86 +1247,99 @@ int read_input(std::vector<source> &sources, char *fname, int maxzoom, int minzo
 	for (size_t i = 0; i < CPUS; i++) {
 		struct reader *r = &readers[i];
 
-		char metaname[strlen(tmpdir) + strlen("/meta.XXXXXXXX") + 1];
 		char poolname[strlen(tmpdir) + strlen("/pool.XXXXXXXX") + 1];
 		char treename[strlen(tmpdir) + strlen("/tree.XXXXXXXX") + 1];
 		char geomname[strlen(tmpdir) + strlen("/geom.XXXXXXXX") + 1];
 		char indexname[strlen(tmpdir) + strlen("/index.XXXXXXXX") + 1];
+		char vertexname[strlen(tmpdir) + strlen("/vertex.XXXXXXXX") + 1];
+		char nodename[strlen(tmpdir) + strlen("/node.XXXXXXXX") + 1];
 
-		sprintf(metaname, "%s%s", tmpdir, "/meta.XXXXXXXX");
-		sprintf(poolname, "%s%s", tmpdir, "/pool.XXXXXXXX");
-		sprintf(treename, "%s%s", tmpdir, "/tree.XXXXXXXX");
-		sprintf(geomname, "%s%s", tmpdir, "/geom.XXXXXXXX");
-		sprintf(indexname, "%s%s", tmpdir, "/index.XXXXXXXX");
+		snprintf(poolname, sizeof(poolname), "%s%s", tmpdir, "/pool.XXXXXXXX");
+		snprintf(treename, sizeof(treename), "%s%s", tmpdir, "/tree.XXXXXXXX");
+		snprintf(geomname, sizeof(geomname), "%s%s", tmpdir, "/geom.XXXXXXXX");
+		snprintf(indexname, sizeof(indexname), "%s%s", tmpdir, "/index.XXXXXXXX");
+		snprintf(vertexname, sizeof(vertexname), "%s%s", tmpdir, "/vertex.XXXXXXXX");
+		snprintf(nodename, sizeof(nodename), "%s%s", tmpdir, "/node.XXXXXXXX");
 
-		r->metafd = mkstemp_cloexec(metaname);
-		if (r->metafd < 0) {
-			perror(metaname);
-			exit(EXIT_FAILURE);
-		}
 		r->poolfd = mkstemp_cloexec(poolname);
 		if (r->poolfd < 0) {
 			perror(poolname);
-			exit(EXIT_FAILURE);
+			exit(EXIT_OPEN);
 		}
 		r->treefd = mkstemp_cloexec(treename);
 		if (r->treefd < 0) {
 			perror(treename);
-			exit(EXIT_FAILURE);
+			exit(EXIT_OPEN);
 		}
 		r->geomfd = mkstemp_cloexec(geomname);
 		if (r->geomfd < 0) {
 			perror(geomname);
-			exit(EXIT_FAILURE);
+			exit(EXIT_OPEN);
 		}
 		r->indexfd = mkstemp_cloexec(indexname);
 		if (r->indexfd < 0) {
 			perror(indexname);
-			exit(EXIT_FAILURE);
+			exit(EXIT_OPEN);
+		}
+		r->vertexfd = mkstemp_cloexec(vertexname);
+		if (r->vertexfd < 0) {
+			perror(vertexname);
+			exit(EXIT_OPEN);
+		}
+		r->nodefd = mkstemp_cloexec(nodename);
+		if (r->nodefd < 0) {
+			perror(nodename);
+			exit(EXIT_OPEN);
 		}
 
-		r->metafile = fopen_oflag(metaname, "wb", O_WRONLY | O_CLOEXEC);
-		if (r->metafile == NULL) {
-			perror(metaname);
-			exit(EXIT_FAILURE);
-		}
 		r->poolfile = memfile_open(r->poolfd);
 		if (r->poolfile == NULL) {
 			perror(poolname);
-			exit(EXIT_FAILURE);
+			exit(EXIT_OPEN);
 		}
 		r->treefile = memfile_open(r->treefd);
 		if (r->treefile == NULL) {
 			perror(treename);
-			exit(EXIT_FAILURE);
+			exit(EXIT_OPEN);
 		}
 		r->geomfile = fopen_oflag(geomname, "wb", O_WRONLY | O_CLOEXEC);
 		if (r->geomfile == NULL) {
 			perror(geomname);
-			exit(EXIT_FAILURE);
+			exit(EXIT_OPEN);
 		}
 		r->indexfile = fopen_oflag(indexname, "wb", O_WRONLY | O_CLOEXEC);
 		if (r->indexfile == NULL) {
 			perror(indexname);
-			exit(EXIT_FAILURE);
+			exit(EXIT_OPEN);
 		}
-		r->metapos = 0;
+		r->vertexfile = fopen_oflag(vertexname, "w+b", O_RDWR | O_CLOEXEC);
+		if (r->vertexfile == NULL) {
+			perror(("open vertexfile " + std::string(vertexname)).c_str());
+			exit(EXIT_OPEN);
+		}
+		r->nodefile = fopen_oflag(nodename, "w+b", O_RDWR | O_CLOEXEC);
+		if (r->nodefile == NULL) {
+			perror(nodename);
+			exit(EXIT_OPEN);
+		}
 		r->geompos = 0;
 		r->indexpos = 0;
+		r->vertexpos = 0;
+		r->nodepos = 0;
 
-		unlink(metaname);
 		unlink(poolname);
 		unlink(treename);
 		unlink(geomname);
 		unlink(indexname);
+		unlink(vertexname);
+		unlink(nodename);
 
 		// To distinguish a null value
 		{
 			struct stringpool p;
-			memfile_write(r->treefile, &p, sizeof(struct stringpool));
+			bool in_memory;
+			memfile_write(r->treefile, &p, sizeof(struct stringpool), in_memory);
 		}
-		// Keep metadata file from being completely empty if no attributes
-		serialize_int(r->metafile, 0, &r->metapos, "meta");
 
 		r->file_bbox[0] = r->file_bbox[1] = UINT_MAX;
 		r->file_bbox[2] = r->file_bbox[3] = 0;
@@ -1230,10 +1347,12 @@ int read_input(std::vector<source> &sources, char *fname, int maxzoom, int minzo
 
 	struct statfs fsstat;
 	if (fstatfs(readers[0].geomfd, &fsstat) != 0) {
-		perror("fstatfs");
-		exit(EXIT_FAILURE);
+		perror("Warning: fstatfs");
+		fprintf(stderr, "Tippecanoe cannot check whether disk space will run out during tiling.\n");
+		diskfree = LLONG_MAX;
+	} else {
+		diskfree = (long long) fsstat.f_bsize * fsstat.f_bavail;
 	}
-	diskfree = (long long) fsstat.f_bsize * fsstat.f_bavail;
 
 	std::atomic<long long> progress_seq(0);
 
@@ -1268,6 +1387,7 @@ int read_input(std::vector<source> &sources, char *fname, int maxzoom, int minzo
 				".geojson",
 				".geobuf",
 				".mbtiles",
+				".pmtiles",
 				".csv",
 				".gz",
 			};
@@ -1318,15 +1438,16 @@ int read_input(std::vector<source> &sources, char *fname, int maxzoom, int minzo
 	long overall_offset = 0;
 	double dist_sum = 0;
 	size_t dist_count = 0;
+	double area_sum = 0;
 
 	int files_open_before_reading = open("/dev/null", O_RDONLY | O_CLOEXEC);
 	if (files_open_before_reading < 0) {
 		perror("open /dev/null");
-		exit(EXIT_FAILURE);
+		exit(EXIT_OPEN);
 	}
 	if (close(files_open_before_reading) != 0) {
 		perror("close");
-		exit(EXIT_FAILURE);
+		exit(EXIT_CLOSE);
 	}
 
 	size_t nsources = sources.size();
@@ -1349,27 +1470,29 @@ int read_input(std::vector<source> &sources, char *fname, int maxzoom, int minzo
 		auto a = layermap.find(sources[source].layer);
 		if (a == layermap.end()) {
 			fprintf(stderr, "Internal error: couldn't find layer %s", sources[source].layer.c_str());
-			exit(EXIT_FAILURE);
+			exit(EXIT_IMPOSSIBLE);
 		}
 		size_t layer = a->second.id;
 
-		if (sources[source].format == "geobuf" || (sources[source].file.size() > 7 && sources[source].file.substr(sources[source].file.size() - 7) == std::string(".geobuf"))) {
+		// geobuf
+		if (sources[source].format == "fgb" || (sources[source].file.size() > 4 && sources[source].file.substr(sources[source].file.size() - 4) == std::string(".fgb"))) {
 			struct stat st;
 			if (fstat(fd, &st) != 0) {
 				perror("fstat");
 				perror(sources[source].file.c_str());
-				exit(EXIT_FAILURE);
+				exit(EXIT_STAT);
 			}
 
 			char *map = (char *) mmap(NULL, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
 			if (map == MAP_FAILED) {
 				fprintf(stderr, "%s: mmap: %s: %s\n", *av, reading.c_str(), strerror(errno));
-				exit(EXIT_FAILURE);
+				exit(EXIT_MEMORY);
 			}
 
 			std::atomic<long long> layer_seq[CPUS];
 			double dist_sums[CPUS];
 			size_t dist_counts[CPUS];
+			double area_sums[CPUS];
 			std::vector<struct serialization_state> sst;
 			sst.resize(CPUS);
 
@@ -1377,6 +1500,7 @@ int read_input(std::vector<source> &sources, char *fname, int maxzoom, int minzo
 				layer_seq[i] = overall_offset;
 				dist_sums[i] = 0;
 				dist_counts[i] = 0;
+				area_sums[i] = 0;
 
 				sst[i].fname = reading.c_str();
 				sst[i].line = 0;
@@ -1389,6 +1513,80 @@ int read_input(std::vector<source> &sources, char *fname, int maxzoom, int minzo
 				sst[i].initialized = &initialized[i];
 				sst[i].dist_sum = &dist_sums[i];
 				sst[i].dist_count = &dist_counts[i];
+				sst[i].area_sum = &area_sums[i];
+				sst[i].want_dist = guess_maxzoom;
+				sst[i].maxzoom = maxzoom;
+				sst[i].filters = prefilter != NULL || postfilter != NULL;
+				sst[i].uses_gamma = uses_gamma;
+				sst[i].layermap = &layermaps[i];
+				sst[i].exclude = exclude;
+				sst[i].include = include;
+				sst[i].exclude_all = exclude_all;
+				sst[i].basezoom = basezoom;
+				sst[i].attribute_types = attribute_types;
+			}
+
+			parse_flatgeobuf(&sst, map, st.st_size, layer, sources[layer].layer);
+
+			for (size_t i = 0; i < CPUS; i++) {
+				dist_sum += dist_sums[i];
+				dist_count += dist_counts[i];
+				area_sum = area_sums[i];
+			}
+
+			if (munmap(map, st.st_size) != 0) {
+				perror("munmap source file");
+				exit(EXIT_MEMORY);
+			}
+			if (close(fd) != 0) {
+				perror("close");
+				exit(EXIT_CLOSE);
+			}
+
+			overall_offset = layer_seq[0];
+			checkdisk(&readers);
+			continue;
+		}
+
+		if (sources[source].format == "geobuf" || (sources[source].file.size() > 7 && sources[source].file.substr(sources[source].file.size() - 7) == std::string(".geobuf"))) {
+			struct stat st;
+			if (fstat(fd, &st) != 0) {
+				perror("fstat");
+				perror(sources[source].file.c_str());
+				exit(EXIT_STAT);
+			}
+
+			char *map = (char *) mmap(NULL, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+			if (map == MAP_FAILED) {
+				fprintf(stderr, "%s: mmap: %s: %s\n", *av, reading.c_str(), strerror(errno));
+				exit(EXIT_MEMORY);
+			}
+
+			std::atomic<long long> layer_seq[CPUS];
+			double dist_sums[CPUS];
+			size_t dist_counts[CPUS];
+			double area_sums[CPUS];
+			std::vector<struct serialization_state> sst;
+			sst.resize(CPUS);
+
+			for (size_t i = 0; i < CPUS; i++) {
+				layer_seq[i] = overall_offset;
+				dist_sums[i] = 0;
+				dist_counts[i] = 0;
+				area_sums[i] = 0;
+
+				sst[i].fname = reading.c_str();
+				sst[i].line = 0;
+				sst[i].layer_seq = &layer_seq[i];
+				sst[i].progress_seq = &progress_seq;
+				sst[i].readers = &readers;
+				sst[i].segment = i;
+				sst[i].initial_x = &initial_x[i];
+				sst[i].initial_y = &initial_y[i];
+				sst[i].initialized = &initialized[i];
+				sst[i].dist_sum = &dist_sums[i];
+				sst[i].dist_count = &dist_counts[i];
+				sst[i].area_sum = &area_sums[i];
 				sst[i].want_dist = guess_maxzoom;
 				sst[i].maxzoom = maxzoom;
 				sst[i].filters = prefilter != NULL || postfilter != NULL;
@@ -1406,15 +1604,16 @@ int read_input(std::vector<source> &sources, char *fname, int maxzoom, int minzo
 			for (size_t i = 0; i < CPUS; i++) {
 				dist_sum += dist_sums[i];
 				dist_count += dist_counts[i];
+				area_sum += area_sums[i];
 			}
 
 			if (munmap(map, st.st_size) != 0) {
 				perror("munmap source file");
-				exit(EXIT_FAILURE);
+				exit(EXIT_MEMORY);
 			}
 			if (close(fd) != 0) {
 				perror("close");
-				exit(EXIT_FAILURE);
+				exit(EXIT_CLOSE);
 			}
 
 			overall_offset = layer_seq[0];
@@ -1426,6 +1625,7 @@ int read_input(std::vector<source> &sources, char *fname, int maxzoom, int minzo
 			std::atomic<long long> layer_seq[CPUS];
 			double dist_sums[CPUS];
 			size_t dist_counts[CPUS];
+			double area_sums[CPUS];
 
 			std::vector<struct serialization_state> sst;
 			sst.resize(CPUS);
@@ -1435,6 +1635,7 @@ int read_input(std::vector<source> &sources, char *fname, int maxzoom, int minzo
 				layer_seq[i] = overall_offset;
 				dist_sums[i] = 0;
 				dist_counts[i] = 0;
+				area_sums[i] = 0;
 
 				sst[i].fname = reading.c_str();
 				sst[i].line = 0;
@@ -1447,6 +1648,7 @@ int read_input(std::vector<source> &sources, char *fname, int maxzoom, int minzo
 				sst[i].initialized = &initialized[i];
 				sst[i].dist_sum = &dist_sums[i];
 				sst[i].dist_count = &dist_counts[i];
+				sst[i].area_sum = &area_sums[i];
 				sst[i].want_dist = guess_maxzoom;
 				sst[i].maxzoom = maxzoom;
 				sst[i].filters = prefilter != NULL || postfilter != NULL;
@@ -1463,7 +1665,7 @@ int read_input(std::vector<source> &sources, char *fname, int maxzoom, int minzo
 
 			if (close(fd) != 0) {
 				perror("close");
-				exit(EXIT_FAILURE);
+				exit(EXIT_CLOSE);
 			}
 
 			overall_offset = layer_seq[0];
@@ -1500,7 +1702,7 @@ int read_input(std::vector<source> &sources, char *fname, int maxzoom, int minzo
 
 				if (munmap(map, st.st_size - off) != 0) {
 					perror("munmap source file");
-					exit(EXIT_FAILURE);
+					exit(EXIT_MEMORY);
 				}
 
 				map = NULL;
@@ -1508,18 +1710,18 @@ int read_input(std::vector<source> &sources, char *fname, int maxzoom, int minzo
 		}
 
 		if (map != NULL && map != MAP_FAILED && read_parallel_this) {
-			do_read_parallel(map, st.st_size - off, overall_offset, reading.c_str(), &readers, &progress_seq, exclude, include, exclude_all, basezoom, layer, &layermaps, initialized, initial_x, initial_y, maxzoom, sources[layer].layer, uses_gamma, attribute_types, read_parallel_this, &dist_sum, &dist_count, guess_maxzoom, prefilter != NULL || postfilter != NULL);
+			do_read_parallel(map, st.st_size - off, overall_offset, reading.c_str(), &readers, &progress_seq, exclude, include, exclude_all, basezoom, layer, &layermaps, initialized, initial_x, initial_y, maxzoom, sources[layer].layer, uses_gamma, attribute_types, read_parallel_this, &dist_sum, &dist_count, &area_sum, guess_maxzoom, prefilter != NULL || postfilter != NULL);
 			overall_offset += st.st_size - off;
 			checkdisk(&readers);
 
 			if (munmap(map, st.st_size - off) != 0) {
 				perror("munmap source file");
-				exit(EXIT_FAILURE);
+				exit(EXIT_MEMORY);
 			}
 
 			if (close(fd) != 0) {
 				perror("close input file");
-				exit(EXIT_FAILURE);
+				exit(EXIT_CLOSE);
 			}
 		} else {
 			STREAM *fp = streamfdopen(fd, "r", sources[layer].file);
@@ -1527,7 +1729,7 @@ int read_input(std::vector<source> &sources, char *fname, int maxzoom, int minzo
 				perror(sources[layer].file.c_str());
 				if (close(fd) != 0) {
 					perror("close source file");
-					exit(EXIT_FAILURE);
+					exit(EXIT_CLOSE);
 				}
 				continue;
 			}
@@ -1541,16 +1743,16 @@ int read_input(std::vector<source> &sources, char *fname, int maxzoom, int minzo
 				// Serial reading of chunks that are then parsed in parallel
 
 				char readname[strlen(tmpdir) + strlen("/read.XXXXXXXX") + 1];
-				sprintf(readname, "%s%s", tmpdir, "/read.XXXXXXXX");
+				snprintf(readname, sizeof(readname), "%s%s", tmpdir, "/read.XXXXXXXX");
 				int readfd = mkstemp_cloexec(readname);
 				if (readfd < 0) {
 					perror(readname);
-					exit(EXIT_FAILURE);
+					exit(EXIT_OPEN);
 				}
 				FILE *readfp = fdopen(readfd, "w");
 				if (readfp == NULL) {
 					perror(readname);
-					exit(EXIT_FAILURE);
+					exit(EXIT_OPEN);
 				}
 				unlink(readname);
 
@@ -1568,7 +1770,8 @@ int read_input(std::vector<source> &sources, char *fname, int maxzoom, int minzo
 				int n;
 
 				while ((n = fp->read(buf, READ_BUF)) > 0) {
-					fwrite_check(buf, sizeof(char), n, readfp, reading.c_str());
+					std::atomic<long long> readingpos;
+					fwrite_check(buf, sizeof(char), n, readfp, &readingpos, reading.c_str());
 					ahead += n;
 
 					if (buf[n - 1] == read_parallel_this && ahead > PARSE_MIN) {
@@ -1580,29 +1783,29 @@ int read_input(std::vector<source> &sources, char *fname, int maxzoom, int minzo
 							if (parser_created) {
 								if (pthread_join(parallel_parser, NULL) != 0) {
 									perror("pthread_join 1088");
-									exit(EXIT_FAILURE);
+									exit(EXIT_PTHREAD);
 								}
 								parser_created = false;
 							}
 
 							fflush(readfp);
-							start_parsing(readfd, streamfpopen(readfp), initial_offset, ahead, &is_parsing, &parallel_parser, parser_created, reading.c_str(), &readers, &progress_seq, exclude, include, exclude_all, basezoom, layer, layermaps, initialized, initial_x, initial_y, maxzoom, sources[layer].layer, gamma != 0, attribute_types, read_parallel_this, &dist_sum, &dist_count, guess_maxzoom, prefilter != NULL || postfilter != NULL);
+							start_parsing(readfd, streamfpopen(readfp), initial_offset, ahead, &is_parsing, &parallel_parser, parser_created, reading.c_str(), &readers, &progress_seq, exclude, include, exclude_all, basezoom, layer, layermaps, initialized, initial_x, initial_y, maxzoom, sources[layer].layer, gamma != 0, attribute_types, read_parallel_this, &dist_sum, &dist_count, &area_sum, guess_maxzoom, prefilter != NULL || postfilter != NULL);
 
 							initial_offset += ahead;
 							overall_offset += ahead;
 							checkdisk(&readers);
 							ahead = 0;
 
-							sprintf(readname, "%s%s", tmpdir, "/read.XXXXXXXX");
+							snprintf(readname, sizeof(readname), "%s%s", tmpdir, "/read.XXXXXXXX");
 							readfd = mkstemp_cloexec(readname);
 							if (readfd < 0) {
 								perror(readname);
-								exit(EXIT_FAILURE);
+								exit(EXIT_OPEN);
 							}
 							readfp = fdopen(readfd, "w");
 							if (readfp == NULL) {
 								perror(readname);
-								exit(EXIT_FAILURE);
+								exit(EXIT_OPEN);
 							}
 							unlink(readname);
 						}
@@ -1615,7 +1818,7 @@ int read_input(std::vector<source> &sources, char *fname, int maxzoom, int minzo
 				if (parser_created) {
 					if (pthread_join(parallel_parser, NULL) != 0) {
 						perror("pthread_join 1122");
-						exit(EXIT_FAILURE);
+						exit(EXIT_PTHREAD);
 					}
 					parser_created = false;
 				}
@@ -1623,7 +1826,7 @@ int read_input(std::vector<source> &sources, char *fname, int maxzoom, int minzo
 				fflush(readfp);
 
 				if (ahead > 0) {
-					start_parsing(readfd, streamfpopen(readfp), initial_offset, ahead, &is_parsing, &parallel_parser, parser_created, reading.c_str(), &readers, &progress_seq, exclude, include, exclude_all, basezoom, layer, layermaps, initialized, initial_x, initial_y, maxzoom, sources[layer].layer, gamma != 0, attribute_types, read_parallel_this, &dist_sum, &dist_count, guess_maxzoom, prefilter != NULL || postfilter != NULL);
+					start_parsing(readfd, streamfpopen(readfp), initial_offset, ahead, &is_parsing, &parallel_parser, parser_created, reading.c_str(), &readers, &progress_seq, exclude, include, exclude_all, basezoom, layer, layermaps, initialized, initial_x, initial_y, maxzoom, sources[layer].layer, gamma != 0, attribute_types, read_parallel_this, &dist_sum, &dist_count, &area_sum, guess_maxzoom, prefilter != NULL || postfilter != NULL);
 
 					if (parser_created) {
 						if (pthread_join(parallel_parser, NULL) != 0) {
@@ -1653,6 +1856,7 @@ int read_input(std::vector<source> &sources, char *fname, int maxzoom, int minzo
 				sst.initialized = &initialized[0];
 				sst.dist_sum = &dist_sum;
 				sst.dist_count = &dist_count;
+				sst.area_sum = &area_sum;
 				sst.want_dist = guess_maxzoom;
 				sst.maxzoom = maxzoom;
 				sst.filters = prefilter != NULL || postfilter != NULL;
@@ -1672,7 +1876,7 @@ int read_input(std::vector<source> &sources, char *fname, int maxzoom, int minzo
 
 			if (fp->fclose() != 0) {
 				perror("fclose input");
-				exit(EXIT_FAILURE);
+				exit(EXIT_CLOSE);
 			}
 		}
 	}
@@ -1680,193 +1884,330 @@ int read_input(std::vector<source> &sources, char *fname, int maxzoom, int minzo
 	int files_open_after_reading = open("/dev/null", O_RDONLY | O_CLOEXEC);
 	if (files_open_after_reading < 0) {
 		perror("open /dev/null");
-		exit(EXIT_FAILURE);
+		exit(EXIT_OPEN);
 	}
 	if (close(files_open_after_reading) != 0) {
 		perror("close");
-		exit(EXIT_FAILURE);
+		exit(EXIT_CLOSE);
 	}
 
 	if (files_open_after_reading > files_open_before_reading) {
 		fprintf(stderr, "Internal error: Files left open after reading input. (%d vs %d)\n",
 			files_open_before_reading, files_open_after_reading);
-		ret = EXIT_FAILURE;
+		ret = EXIT_IMPOSSIBLE;
 	}
 
 	if (!quiet) {
 		fprintf(stderr, "                              \r");
 		//     (stderr, "Read 10000.00 million features\r", *progress_seq / 1000000.0);
+		fflush(stderr);
 	}
 
+	std::atomic<long long> vertexpos(0);
+	std::atomic<long long> nodepos(0);
+
 	for (size_t i = 0; i < CPUS; i++) {
-		if (fclose(readers[i].metafile) != 0) {
-			perror("fclose meta");
-			exit(EXIT_FAILURE);
-		}
 		if (fclose(readers[i].geomfile) != 0) {
 			perror("fclose geom");
-			exit(EXIT_FAILURE);
+			exit(EXIT_CLOSE);
 		}
 		if (fclose(readers[i].indexfile) != 0) {
 			perror("fclose index");
-			exit(EXIT_FAILURE);
+			exit(EXIT_CLOSE);
 		}
 		memfile_close(readers[i].treefile);
 
 		if (fstat(readers[i].geomfd, &readers[i].geomst) != 0) {
 			perror("stat geom\n");
-			exit(EXIT_FAILURE);
+			exit(EXIT_STAT);
 		}
-		if (fstat(readers[i].metafd, &readers[i].metast) != 0) {
-			perror("stat meta\n");
-			exit(EXIT_FAILURE);
-		}
+
+		vertexpos += readers[i].vertexpos;
+		nodepos += readers[i].nodepos;
 	}
 
-	// Create a combined string pool and a combined metadata file
+	if (!quiet) {
+		fprintf(stderr, "Merging string pool           \r");
+	}
+
+	// Create a combined string pool
 	// but keep track of the offsets into it since we still need
 	// segment+offset to find the data.
 
 	// 2 * CPUS: One per input thread, one per tiling thread
 	long long pool_off[2 * CPUS];
-	long long meta_off[2 * CPUS];
 	for (size_t i = 0; i < 2 * CPUS; i++) {
-		pool_off[i] = meta_off[i] = 0;
+		pool_off[i] = 0;
 	}
 
 	char poolname[strlen(tmpdir) + strlen("/pool.XXXXXXXX") + 1];
-	sprintf(poolname, "%s%s", tmpdir, "/pool.XXXXXXXX");
+	snprintf(poolname, sizeof(poolname), "%s%s", tmpdir, "/pool.XXXXXXXX");
 
 	int poolfd = mkstemp_cloexec(poolname);
 	if (poolfd < 0) {
 		perror(poolname);
-		exit(EXIT_FAILURE);
+		exit(EXIT_OPEN);
 	}
 
 	FILE *poolfile = fopen_oflag(poolname, "wb", O_WRONLY | O_CLOEXEC);
 	if (poolfile == NULL) {
 		perror(poolname);
-		exit(EXIT_FAILURE);
+		exit(EXIT_OPEN);
 	}
 
 	unlink(poolname);
-
-	char metaname[strlen(tmpdir) + strlen("/meta.XXXXXXXX") + 1];
-	sprintf(metaname, "%s%s", tmpdir, "/meta.XXXXXXXX");
-
-	int metafd = mkstemp_cloexec(metaname);
-	if (metafd < 0) {
-		perror(metaname);
-		exit(EXIT_FAILURE);
-	}
-
-	FILE *metafile = fopen_oflag(metaname, "wb", O_WRONLY | O_CLOEXEC);
-	if (metafile == NULL) {
-		perror(metaname);
-		exit(EXIT_FAILURE);
-	}
-
-	unlink(metaname);
-
-	std::atomic<long long> metapos(0);
 	std::atomic<long long> poolpos(0);
 
 	for (size_t i = 0; i < CPUS; i++) {
-		if (readers[i].metapos > 0) {
-			void *map = mmap(NULL, readers[i].metapos, PROT_READ, MAP_PRIVATE, readers[i].metafd, 0);
-			if (map == MAP_FAILED) {
-				perror("mmap unmerged meta");
-				exit(EXIT_FAILURE);
+		// If the memfile is not done yet, it is in memory, so just copy the memory.
+		// Otherwise, we need to merge memory and file.
+
+		if (readers[i].poolfile->fp == NULL) {
+			// still in memory
+
+			if (readers[i].poolfile->map.size() > 0) {
+				if (fwrite(readers[i].poolfile->map.c_str(), readers[i].poolfile->map.size(), 1, poolfile) != 1) {
+					perror("Reunify string pool");
+					exit(EXIT_WRITE);
+				}
 			}
-			madvise(map, readers[i].metapos, MADV_SEQUENTIAL);
-			madvise(map, readers[i].metapos, MADV_WILLNEED);
-			if (fwrite(map, readers[i].metapos, 1, metafile) != 1) {
-				perror("Reunify meta");
-				exit(EXIT_FAILURE);
+
+			pool_off[i] = poolpos;
+			poolpos += readers[i].poolfile->map.size();
+		} else {
+			// split into memory and file
+
+			if (fflush(readers[i].poolfile->fp) != 0) {
+				perror("fflush poolfile");
+				exit(EXIT_WRITE);
 			}
-			madvise(map, readers[i].metapos, MADV_DONTNEED);
-			if (munmap(map, readers[i].metapos) != 0) {
-				perror("unmap unmerged meta");
+
+			char *s = (char *) mmap(NULL, readers[i].poolfile->off, PROT_READ, MAP_PRIVATE, readers[i].poolfile->fd, 0);
+			if (s == MAP_FAILED) {
+				perror("mmap string pool for copy");
+				exit(EXIT_MEMORY);
 			}
+			madvise(s, readers[i].poolfile->off, MADV_SEQUENTIAL);
+			if (fwrite(s, sizeof(char), readers[i].poolfile->off, poolfile) != readers[i].poolfile->off) {
+				perror("Reunify string pool (split)");
+				exit(EXIT_WRITE);
+			}
+			if (munmap(s, readers[i].poolfile->off) != 0) {
+				perror("unmap string pool for copy");
+				exit(EXIT_MEMORY);
+			}
+
+			pool_off[i] = poolpos;
+			poolpos += readers[i].poolfile->off;
 		}
 
-		meta_off[i] = metapos;
-		metapos += readers[i].metapos;
-		if (close(readers[i].metafd) != 0) {
-			perror("close unmerged meta");
-		}
-
-		if (readers[i].poolfile->off > 0) {
-			if (fwrite(readers[i].poolfile->map, readers[i].poolfile->off, 1, poolfile) != 1) {
-				perror("Reunify string pool");
-				exit(EXIT_FAILURE);
-			}
-		}
-
-		pool_off[i] = poolpos;
-		poolpos += readers[i].poolfile->off;
 		memfile_close(readers[i].poolfile);
 	}
 
 	if (fclose(poolfile) != 0) {
 		perror("fclose pool");
-		exit(EXIT_FAILURE);
+		exit(EXIT_CLOSE);
 	}
-	if (fclose(metafile) != 0) {
-		perror("fclose meta");
-		exit(EXIT_FAILURE);
-	}
-
-	char *meta = (char *) mmap(NULL, metapos, PROT_READ, MAP_PRIVATE, metafd, 0);
-	if (meta == MAP_FAILED) {
-		perror("mmap meta");
-		exit(EXIT_FAILURE);
-	}
-	madvise(meta, metapos, MADV_RANDOM);
 
 	char *stringpool = NULL;
 	if (poolpos > 0) {  // Will be 0 if -X was specified
 		stringpool = (char *) mmap(NULL, poolpos, PROT_READ, MAP_PRIVATE, poolfd, 0);
 		if (stringpool == MAP_FAILED) {
 			perror("mmap string pool");
-			exit(EXIT_FAILURE);
+			exit(EXIT_MEMORY);
 		}
 		madvise(stringpool, poolpos, MADV_RANDOM);
 	}
 
+	if (!quiet) {
+		fprintf(stderr, "Merging vertices              \r");
+	}
+
+	// Sort the vertices;
+	// find nodes where the same central point is part of two different vertices
+	{
+		std::string tmpname = std::string(tmpdir) + "/vertex2.XXXXXX";
+		int vertexfd = mkstemp((char *) tmpname.c_str());
+		if (vertexfd < 0) {
+			perror(("mkstemp vertexfile " + std::string(tmpname)).c_str());
+			exit(EXIT_OPEN);
+		}
+		unlink(tmpname.c_str());
+		FILE *vertex_out = fdopen(vertexfd, "w+b");
+		if (vertex_out == NULL) {
+			perror(tmpname.c_str());
+			exit(EXIT_OPEN);
+		}
+
+		std::vector<FILE *> vertex_readers;
+		for (size_t i = 0; i < CPUS; i++) {
+			vertex_readers.push_back(readers[i].vertexfile);
+			rewind(readers[i].vertexfile);
+		}
+		fqsort(vertex_readers, sizeof(vertex), vertexcmp, vertex_out, memsize / 20);
+
+		for (size_t i = 0; i < CPUS; i++) {
+			if (fclose(readers[i].vertexfile) != 0) {
+				perror("fclose vertex");
+				exit(EXIT_CLOSE);
+			}
+		}
+
+		rewind(vertex_out);
+
+		vertex prev(draw(VT_MOVETO, 0, 0), draw(VT_MOVETO, 0, 0), draw(VT_MOVETO, 0, 0));
+		vertex v(draw(VT_MOVETO, 0, 0), draw(VT_MOVETO, 0, 0), draw(VT_MOVETO, 0, 0));
+		while (fread((void *) &v, sizeof(vertex), 1, vertex_out)) {
+			if (v.mid == prev.mid && (v.p1 != prev.p1 || v.p2 != prev.p2)) {
+				long long x = v.mid.x * (1LL << geometry_scale);
+				long long y = v.mid.y * (1LL << geometry_scale);
+
+#if 0
+				double lon, lat;
+				tile2lonlat(x, y, 32, &lon, &lat);
+				printf("{\"type\":\"Feature\", \"properties\":{}, \"geometry\":{\"type\":\"Point\", \"coordinates\":[%f,%f]}}\n", lon, lat);
+#endif
+
+				struct node n;
+				n.index = encode_quadkey((unsigned) x, (unsigned) y);
+
+				fwrite_check((char *) &n, sizeof(struct node), 1, readers[0].nodefile, &readers[0].nodepos, "vertices");
+			}
+			prev = v;
+		}
+
+		fclose(vertex_out);
+	}
+
+	if (!quiet) {
+		fprintf(stderr, "Merging nodes                 \r");
+	}
+
+	// Sort nodes that can't be simplified away; scan the list to remove duplicates
+
+	FILE *shared_nodes;
+	node *shared_nodes_map = NULL;	// will be null if there are no shared nodes
+	{
+		// sort
+
+		std::string tmpname = std::string(tmpdir) + "/node2.XXXXXX";
+		int nodefd = mkstemp((char *) tmpname.c_str());
+		if (nodefd < 0) {
+			perror(("mkstemp nodefile " + std::string(tmpname)).c_str());
+			exit(EXIT_OPEN);
+		}
+		unlink(tmpname.c_str());
+		FILE *node_out;
+		node_out = fdopen(nodefd, "w+b");
+		if (node_out == NULL) {
+			perror(tmpname.c_str());
+			exit(EXIT_OPEN);
+		}
+
+		std::vector<FILE *> node_readers;
+		for (size_t i = 0; i < CPUS; i++) {
+			node_readers.push_back(readers[i].nodefile);
+			rewind(readers[i].nodefile);
+		}
+
+		fqsort(node_readers, sizeof(node), nodecmp, node_out, memsize / 20);
+
+		for (size_t i = 0; i < CPUS; i++) {
+			if (fclose(readers[i].nodefile) != 0) {
+				perror("fclose node");
+				exit(EXIT_CLOSE);
+			}
+		}
+
+		rewind(node_out);
+
+		// scan
+
+		tmpname = std::string(tmpdir) + "/node3.XXXXXX";
+		nodefd = mkstemp((char *) tmpname.c_str());
+		if (nodefd < 0) {
+			perror(("mkstemp nodefile " + std::string(tmpname)).c_str());
+			exit(EXIT_OPEN);
+		}
+		unlink(tmpname.c_str());
+		shared_nodes = fdopen(nodefd, "w+b");
+		if (shared_nodes == NULL) {
+			perror(tmpname.c_str());
+			exit(EXIT_OPEN);
+		}
+
+		// `written` is to see if this node has already been preserved
+		// and doesn't need to be preserved again
+		struct node written;
+		written.index = ULONG_MAX;
+
+		nodepos = 0;
+		struct node here;
+		while (fread((void *) &here, sizeof(here), 1, node_out)) {
+			if (nodecmp((void *) &here, (void *) &written) != 0) {
+				fwrite_check((void *) &here, sizeof(here), 1, shared_nodes, &nodepos, "shared nodes");
+				written = here;
+
+#if 0
+				unsigned wx, wy;
+				decode_quadkey(here.index, &wx, &wy);
+				double lon, lat;
+				tile2lonlat(wx, wy, 32, &lon, &lat);
+				printf("{\"type\":\"Feature\", \"properties\":{}, \"geometry\":{\"type\":\"Point\", \"coordinates\":[%f,%f]}}\n", lon, lat);
+#endif
+			}
+		}
+
+		fflush(shared_nodes);
+
+		if (nodepos > 0) {
+			shared_nodes_map = (node *) mmap(NULL, nodepos, PROT_READ, MAP_PRIVATE, nodefd, 0);
+			if (shared_nodes_map == (node *) MAP_FAILED) {
+				perror("mmap nodes");
+				exit(EXIT_MEMORY);
+			}
+		}
+
+		fclose(node_out);
+	}
+
+	if (!quiet) {
+		fprintf(stderr, "Merging index                 \r");
+	}
+
 	char indexname[strlen(tmpdir) + strlen("/index.XXXXXXXX") + 1];
-	sprintf(indexname, "%s%s", tmpdir, "/index.XXXXXXXX");
+	snprintf(indexname, sizeof(indexname), "%s%s", tmpdir, "/index.XXXXXXXX");
 
 	int indexfd = mkstemp_cloexec(indexname);
 	if (indexfd < 0) {
 		perror(indexname);
-		exit(EXIT_FAILURE);
+		exit(EXIT_OPEN);
 	}
 	FILE *indexfile = fopen_oflag(indexname, "wb", O_WRONLY | O_CLOEXEC);
 	if (indexfile == NULL) {
 		perror(indexname);
-		exit(EXIT_FAILURE);
+		exit(EXIT_OPEN);
 	}
 
 	unlink(indexname);
 
 	char geomname[strlen(tmpdir) + strlen("/geom.XXXXXXXX") + 1];
-	sprintf(geomname, "%s%s", tmpdir, "/geom.XXXXXXXX");
+	snprintf(geomname, sizeof(geomname), "%s%s", tmpdir, "/geom.XXXXXXXX");
 
 	int geomfd = mkstemp_cloexec(geomname);
 	if (geomfd < 0) {
 		perror(geomname);
-		exit(EXIT_FAILURE);
+		exit(EXIT_CLOSE);
 	}
 	FILE *geomfile = fopen_oflag(geomname, "wb", O_WRONLY | O_CLOEXEC);
 	if (geomfile == NULL) {
 		perror(geomname);
-		exit(EXIT_FAILURE);
+		exit(EXIT_OPEN);
 	}
 	unlink(geomname);
 
 	unsigned iz = 0, ix = 0, iy = 0;
-	choose_first_zoom(file_bbox, readers, &iz, &ix, &iy, minzoom, buffer);
+	choose_first_zoom(file_bbox, file_bbox1, file_bbox2, readers, &iz, &ix, &iy, minzoom, buffer);
 
 	if (justx >= 0) {
 		iz = minzoom;
@@ -1876,7 +2217,7 @@ int read_input(std::vector<source> &sources, char *fname, int maxzoom, int minzo
 
 	std::atomic<long long> geompos(0);
 
-	/* initial tile is 0/0/0 */
+	/* initial tile is normally 0/0/0 but can be iz/ix/iy if limited to one tile */
 	serialize_int(geomfile, iz, &geompos, fname);
 	serialize_uint(geomfile, ix, &geompos, fname);
 	serialize_uint(geomfile, iy, &geompos, fname);
@@ -1884,21 +2225,21 @@ int read_input(std::vector<source> &sources, char *fname, int maxzoom, int minzo
 	radix(readers, CPUS, geomfile, indexfile, tmpdir, &geompos, maxzoom, basezoom, droprate, gamma);
 
 	/* end of tile */
-	serialize_byte(geomfile, -2, &geompos, fname);
+	serialize_ulong_long(geomfile, 0, &geompos, fname);  // EOF
 
 	if (fclose(geomfile) != 0) {
 		perror("fclose geom");
-		exit(EXIT_FAILURE);
+		exit(EXIT_CLOSE);
 	}
 	if (fclose(indexfile) != 0) {
 		perror("fclose index");
-		exit(EXIT_FAILURE);
+		exit(EXIT_CLOSE);
 	}
 
 	struct stat indexst;
 	if (fstat(indexfd, &indexst) < 0) {
 		perror("stat index");
-		exit(EXIT_FAILURE);
+		exit(EXIT_STAT);
 	}
 	std::atomic<long long> indexpos(indexst.st_size);
 	progress_seq = indexpos / sizeof(struct index);
@@ -1907,9 +2248,10 @@ int read_input(std::vector<source> &sources, char *fname, int maxzoom, int minzo
 	if (!quiet) {
 		long long s = progress_seq;
 		long long geompos_print = geompos;
-		long long metapos_print = metapos;
 		long long poolpos_print = poolpos;
-		fprintf(stderr, "%lld features, %lld bytes of geometry, %lld bytes of separate metadata, %lld bytes of string pool\n", s, geompos_print, metapos_print, poolpos_print);
+		long long vertexpos_print = vertexpos;
+		long long nodepos_print = nodepos;
+		fprintf(stderr, "%lld features, %lld bytes of geometry and attributes, %lld bytes of string pool, %lld bytes of vertices, %lld bytes of nodes\n", s, geompos_print, poolpos_print, vertexpos_print, nodepos_print);
 	}
 
 	if (indexpos == 0) {
@@ -1917,13 +2259,13 @@ int read_input(std::vector<source> &sources, char *fname, int maxzoom, int minzo
 		if (outdb != NULL) {
 			mbtiles_close(outdb, pgm);
 		}
-		exit(EXIT_FAILURE);
+		exit(EXIT_NODATA);
 	}
 
 	struct index *map = (struct index *) mmap(NULL, indexpos, PROT_READ, MAP_PRIVATE, indexfd, 0);
 	if (map == MAP_FAILED) {
 		perror("mmap index for basezoom");
-		exit(EXIT_FAILURE);
+		exit(EXIT_MEMORY);
 	}
 	madvise(map, indexpos, MADV_SEQUENTIAL);
 	madvise(map, indexpos, MADV_WILLNEED);
@@ -1931,15 +2273,44 @@ int read_input(std::vector<source> &sources, char *fname, int maxzoom, int minzo
 	bool fix_dropping = false;
 
 	if (guess_maxzoom) {
-		double sum = 0;
+		double mean = 0;
 		size_t count = 0;
+		double m2 = 0;
 
 		long long progress = -1;
 		long long ip;
 		for (ip = 1; ip < indices; ip++) {
 			if (map[ip].ix != map[ip - 1].ix) {
+#if 0
+				// This #ifdef block provides data to empirically determine the relationship
+				// between a difference in quadkey index and a ground distance in feet:
+				//
+				// $ ./tippecanoe --no-tile-size-limit -zg -f -o foo.mbtiles ne_10m_populated_places.json > /tmp/points
+				// gnuplot> stats "/tmp/points" using (log($2)):(log($3))
+
+				unsigned wx1, wy1, wx2, wy2;
+				decode_quadkey(map[ip - 1].ix, &wx1, &wy1);
+				decode_quadkey(map[ip].ix, &wx2, &wy2);
+
+				double x1, y1, x2, y2;
+				x1 = (wx1 * 360.0 / UINT_MAX - 180.0) / .00000274;
+				y1 = (wy1 * 360.0 / UINT_MAX - 180.0) / .00000274;
+				x2 = (wx2 * 360.0 / UINT_MAX - 180.0) / .00000274;
+				y2 = (wy2 * 360.0 / UINT_MAX - 180.0) / .00000274;
+				double dx = x1 - x2;
+				double dy = y1 - y2;
+				double d = sqrt(dx * dx + dy * dy);
+
+				printf("%llu %llu %0.2f\n", map[ip].ix, map[ip].ix - map[ip - 1].ix, d);
+#endif
+
+				// https://en.wikipedia.org/wiki/Algorithms_for_calculating_variance#Welford's_online_algorithm
+				double newValue = log(map[ip].ix - map[ip - 1].ix);
 				count++;
-				sum += log(map[ip].ix - map[ip - 1].ix);
+				double delta = newValue - mean;
+				mean += delta / count;
+				double delta2 = newValue - mean;
+				m2 += delta * delta2;
 			}
 
 			long long nprogress = 100 * ip / indices;
@@ -1947,27 +2318,40 @@ int read_input(std::vector<source> &sources, char *fname, int maxzoom, int minzo
 				progress = nprogress;
 				if (!quiet && !quiet_progress && progress_time()) {
 					fprintf(stderr, "Maxzoom: %lld%% \r", progress);
+					fflush(stderr);
 				}
 			}
 		}
 
-		if (count == 0 && dist_count == 0) {
+		if (count == 0 && dist_count == 0 && minimum_maxzoom == 0) {
 			fprintf(stderr, "Can't guess maxzoom (-zg) without at least two distinct feature locations\n");
 			if (outdb != NULL) {
 				mbtiles_close(outdb, pgm);
 			}
-			exit(EXIT_FAILURE);
+			exit(EXIT_NODATA);
 		}
 
-		if (count > 0) {
-			// Geometric mean is appropriate because distances between features
-			// are typically lognormally distributed
-			double avg = exp(sum / count);
+		if (count == 0 && dist_count == 0) {
+			maxzoom = minimum_maxzoom;
+			if (droprate < 0) {
+				droprate = 1;
+			}
+		} else if (count > 0) {
+			double stddev = sqrt(m2 / count);
 
-			// Convert approximately from tile units to feet
+			// Geometric mean is appropriate because distances between features
+			// are typically lognormally distributed. Two standard deviations
+			// below the mean should be enough to distinguish most features.
+			double avg = exp(mean);
+			double nearby = exp(mean - 1.5 * stddev);
+
+			// Convert approximately from tile units to feet.
+			// See empirical data above for source
 			double dist_ft = sqrt(avg) / 33;
-			// Factor of 8 (3 zooms) beyond minimum required to distinguish features
-			double want = dist_ft / 8;
+			double nearby_ft = sqrt(nearby) / 33;
+
+			// Go one zoom level beyond what is strictly necessary for nearby features.
+			double want = nearby_ft / 2;
 
 			maxzoom = ceil(log(360 / (.00000274 * want)) / log(2) - full_detail);
 			if (maxzoom < 0) {
@@ -1981,11 +2365,16 @@ int read_input(std::vector<source> &sources, char *fname, int maxzoom, int minzo
 			}
 
 			if (!quiet) {
-				fprintf(stderr, "Choosing a maxzoom of -z%d for features about %d feet (%d meters) apart\n", maxzoom, (int) ceil(dist_ft), (int) ceil(dist_ft / 3.28084));
+				fprintf(stderr,
+					"Choosing a maxzoom of -z%d for features typically %d feet (%d meters) apart, ",
+					maxzoom,
+					(int) ceil(dist_ft), (int) ceil(dist_ft / 3.28084));
+				fprintf(stderr, "and at least %d feet (%d meters) apart\n",
+					(int) ceil(nearby_ft), (int) ceil(nearby_ft / 3.28084));
 			}
 
 			bool changed = false;
-			while (maxzoom < 32 - full_detail && maxzoom < 33 - low_detail && cluster_distance > 0) {
+			while (maxzoom < 32 - full_detail && maxzoom < 33 - low_detail && maxzoom < cluster_maxzoom && cluster_distance > 0) {
 				unsigned long long zoom_mingap = ((1LL << (32 - maxzoom)) / 256 * cluster_distance) * ((1LL << (32 - maxzoom)) / 256 * cluster_distance);
 				if (avg > zoom_mingap) {
 					break;
@@ -1995,11 +2384,30 @@ int read_input(std::vector<source> &sources, char *fname, int maxzoom, int minzo
 				changed = true;
 			}
 			if (changed) {
-				printf("Choosing a maxzoom of -z%d to keep most features distinct with cluster distance %d\n", maxzoom, cluster_distance);
+				printf("Choosing a maxzoom of -z%d to keep most features distinct with cluster distance %d and cluster maxzoom %d\n", maxzoom, cluster_distance, cluster_maxzoom);
+			}
+
+			if (droprate == -3) {
+				// This mysterious formula is the result of eyeballing the appropriate drop rate
+				// for several point tilesets using -zg and then fitting a curve to the pattern
+				// that emerged. It appears that if the standard deviation of the distances between
+				// features is small, the drop rate should be large because the features are evenly
+				// spaced, and if the standard deviation is large, the drop rate can be small because
+				// the features are in clumps.
+				droprate = exp(-0.7681 * log(stddev) + 1.582);
+
+				if (droprate < 0) {
+					droprate = 0;
+				}
+
+				if (!quiet) {
+					fprintf(stderr, "Choosing a drop rate of %f\n", droprate);
+				}
 			}
 		}
 
 		if (dist_count != 0) {
+			// no conversion to pseudo-feet here because that already happened within each feature
 			double want2 = exp(dist_sum / dist_count) / 8;
 			int mz = ceil(log(360 / (.00000274 * want2)) / log(2) - full_detail);
 
@@ -2021,16 +2429,55 @@ int read_input(std::vector<source> &sources, char *fname, int maxzoom, int minzo
 			}
 		}
 
+		double total_tile_count = 0;
+		for (int i = 1; i <= maxzoom; i++) {
+			double tile_count = ceil(area_sum / ((1LL << (32 - i)) * (1LL << (32 - i))));
+			total_tile_count += tile_count;
+
+			// 2M tiles is an arbitrary limit, chosen to make tiling jobs
+			// that seem like they should finish in a few minutes
+			// actually finish in a few minutes. It is large enough to
+			// tile a polygon that covers the entire world to z10
+			// or the United States to z13.
+
+			if (total_tile_count > 2 * 1024 * 1024) {
+				printf("Limiting maxzoom to -z%d to keep from generating %lld tiles\n", i - 1, (long long) total_tile_count);
+				maxzoom = i - 1;
+				break;
+			}
+		}
+
+		if (basezoom == -2 && basezoom_marker_width == 1) {  // -Bg, not -Bg###
+			basezoom = maxzoom;
+			if (!quiet) {
+				fprintf(stderr, "Using base zoom of -z%d\n", basezoom);
+			}
+		}
+
+		if (maxzoom < minimum_maxzoom) {
+			if (!quiet) {
+				fprintf(stderr, "Using minimum maxzoom of -z%d\n", minimum_maxzoom);
+			}
+			maxzoom = minimum_maxzoom;
+		}
+
 		if (maxzoom < minzoom) {
-			fprintf(stderr, "Can't use %d for maxzoom because minzoom is %d\n", maxzoom, minzoom);
+			if (!quiet) {
+				fprintf(stderr, "Can't use %d for maxzoom because minzoom is %d\n", maxzoom, minzoom);
+			}
 			maxzoom = minzoom;
 		}
 
 		fix_dropping = true;
 
-		if (basezoom == -1) {
+		if (basezoom == -1) {  // basezoom unspecified
 			basezoom = maxzoom;
 		}
+	}
+
+	if (cluster_maxzoom >= maxzoom && guess_cluster_maxzoom) {
+		cluster_maxzoom = maxzoom - 1;
+		fprintf(stderr, "Choosing a cluster maxzoom of -k%d to make all features visible at maximum zoom %d\n", cluster_maxzoom, maxzoom);
 	}
 
 	if (basezoom < 0 || droprate < 0) {
@@ -2063,6 +2510,7 @@ int read_input(std::vector<source> &sources, char *fname, int maxzoom, int minzo
 				progress = nprogress;
 				if (!quiet && !quiet_progress && progress_time()) {
 					fprintf(stderr, "Base zoom/drop rate: %lld%% \r", progress);
+					fflush(stderr);
 				}
 			}
 
@@ -2070,6 +2518,8 @@ int read_input(std::vector<source> &sources, char *fname, int maxzoom, int minzo
 			for (z = 0; z <= MAX_ZOOM; z++) {
 				unsigned xxx = 0, yyy = 0;
 				if (z != 0) {
+					// These are tile numbers, not pixels,
+					// so shift, not round
 					xxx = xx >> (32 - z);
 					yyy = yy >> (32 - z);
 				}
@@ -2125,6 +2575,10 @@ int read_input(std::vector<source> &sources, char *fname, int maxzoom, int minzo
 			}
 		}
 
+		if (obasezoom < 0 && basezoom > maxzoom && prevent[P_BASEZOOM_ABOVE_MAXZOOM]) {
+			basezoom = maxzoom;
+		}
+
 		if (obasezoom < 0 && basezoom > maxzoom) {
 			fprintf(stderr, "Couldn't find a suitable base zoom. Working from the other direction.\n");
 			if (gamma == 0) {
@@ -2135,7 +2589,7 @@ int read_input(std::vector<source> &sources, char *fname, int maxzoom, int minzo
 				if (maxzoom == 0) {
 					droprate = 2.5;
 				} else {
-					droprate = exp(log((long double) max[0].count / max[maxzoom].count) / (maxzoom));
+					droprate = exp(log((double) max[0].count / max[maxzoom].count) / (maxzoom));
 					if (!quiet) {
 						fprintf(stderr, "Choosing a drop rate of -r%f to get from %lld to %lld in %d zooms\n", droprate, max[maxzoom].count, max[0].count, maxzoom);
 					}
@@ -2144,7 +2598,7 @@ int read_input(std::vector<source> &sources, char *fname, int maxzoom, int minzo
 
 			basezoom = 0;
 			for (z = 0; z <= maxzoom; z++) {
-				double zoomdiff = log((long double) max[z].count / max_features) / log(droprate);
+				double zoomdiff = log((double) max[z].count / max_features) / log(droprate);
 				if (zoomdiff + z > basezoom) {
 					basezoom = ceil(zoomdiff + z);
 				}
@@ -2160,7 +2614,7 @@ int read_input(std::vector<source> &sources, char *fname, int maxzoom, int minzo
 				double interval = exp(log(droprate) * (basezoom - z));
 
 				if (max[z].count / interval >= max_features) {
-					interval = (long double) max[z].count / max_features;
+					interval = (double) max[z].count / max_features;
 					droprate = exp(log(interval) / (basezoom - z));
 					interval = exp(log(droprate) * (basezoom - z));
 
@@ -2208,19 +2662,19 @@ int read_input(std::vector<source> &sources, char *fname, int maxzoom, int minzo
 		fix_dropping = true;
 	}
 
-	if (fix_dropping) {
+	if (fix_dropping || drop_denser > 0) {
 		// Fix up the minzooms for features, now that we really know the base zoom
 		// and drop rate.
 
 		struct stat geomst;
 		if (fstat(geomfd, &geomst) != 0) {
 			perror("stat sorted geom\n");
-			exit(EXIT_FAILURE);
+			exit(EXIT_STAT);
 		}
 		char *geom = (char *) mmap(NULL, geomst.st_size, PROT_READ | PROT_WRITE, MAP_SHARED, geomfd, 0);
 		if (geom == MAP_FAILED) {
 			perror("mmap geom for fixup");
-			exit(EXIT_FAILURE);
+			exit(EXIT_MEMORY);
 		}
 		madvise(geom, indexpos, MADV_SEQUENTIAL);
 		madvise(geom, indexpos, MADV_WILLNEED);
@@ -2228,12 +2682,50 @@ int read_input(std::vector<source> &sources, char *fname, int maxzoom, int minzo
 		struct drop_state ds[maxzoom + 1];
 		prep_drop_states(ds, maxzoom, basezoom, droprate);
 
-		for (long long ip = 0; ip < indices; ip++) {
-			if (ip > 0 && map[ip].start != map[ip - 1].end) {
-				fprintf(stderr, "Mismatched index at %lld: %lld vs %lld\n", ip, map[ip].start, map[ip].end);
+		if (drop_denser > 0) {
+			std::vector<drop_densest> ddv;
+			unsigned long long previndex = 0;
+
+			for (long long ip = 0; ip < indices; ip++) {
+				if (map[ip].t == VT_POINT ||
+				    (additional[A_LINE_DROP] && map[ip].t == VT_LINE) ||
+				    (additional[A_POLYGON_DROP] && map[ip].t == VT_POLYGON)) {
+					if (map[ip].ix % 100 < drop_denser) {
+						drop_densest dd;
+						dd.gap = map[ip].ix - previndex;
+						dd.seq = ip;
+						ddv.push_back(dd);
+
+						previndex = map[ip].ix;
+					} else {
+						int feature_minzoom = calc_feature_minzoom(&map[ip], ds, maxzoom, gamma);
+						geom[map[ip].end - 1] = feature_minzoom;
+					}
+				}
 			}
-			int feature_minzoom = calc_feature_minzoom(&map[ip], ds, maxzoom, gamma);
-			geom[map[ip].end - 1] = feature_minzoom;
+
+			std::stable_sort(ddv.begin(), ddv.end());
+
+			size_t i = 0;
+			for (int z = 0; z <= basezoom; z++) {
+				double keep_fraction = 1.0 / std::exp(std::log(droprate) * (basezoom - z));
+				size_t keep_count = ddv.size() * keep_fraction;
+
+				for (; i < keep_count && i < ddv.size(); i++) {
+					geom[map[ddv[i].seq].end - 1] = z;
+				}
+			}
+			for (; i < ddv.size(); i++) {
+				geom[map[ddv[i].seq].end - 1] = basezoom;
+			}
+		} else {
+			for (long long ip = 0; ip < indices; ip++) {
+				if (ip > 0 && map[ip].start != map[ip - 1].end) {
+					fprintf(stderr, "Mismatched index at %lld: %lld vs %lld\n", ip, map[ip].start, map[ip].end);
+				}
+				int feature_minzoom = calc_feature_minzoom(&map[ip], ds, maxzoom, gamma);
+				geom[map[ip].end - 1] = feature_minzoom;
+			}
 		}
 
 		munmap(geom, geomst.st_size);
@@ -2251,7 +2743,7 @@ int read_input(std::vector<source> &sources, char *fname, int maxzoom, int minzo
 	struct stat geomst;
 	if (fstat(geomfd, &geomst) != 0) {
 		perror("stat sorted geom\n");
-		exit(EXIT_FAILURE);
+		exit(EXIT_STAT);
 	}
 
 	int fd[TEMP_FILES];
@@ -2267,25 +2759,18 @@ int read_input(std::vector<source> &sources, char *fname, int maxzoom, int minzo
 
 	std::atomic<unsigned> midx(0);
 	std::atomic<unsigned> midy(0);
-	int written = traverse_zooms(fd, size, meta, stringpool, &midx, &midy, maxzoom, minzoom, outdb, outdir, buffer, fname, tmpdir, gamma, full_detail, low_detail, min_detail, meta_off, pool_off, initial_x, initial_y, simplification, layermaps, prefilter, postfilter, attribute_accum, filter, persent);
+	std::vector<strategy> strategies;
+	int written = traverse_zooms(fd, size, stringpool, &midx, &midy, maxzoom, minzoom, outdb, outdir, buffer, fname, tmpdir, gamma, full_detail, low_detail, min_detail, pool_off, initial_x, initial_y, simplification, maxzoom_simplification, layermaps, prefilter, postfilter, attribute_accum, filter, strategies, iz, shared_nodes_map, nodepos, basezoom, droprate, unidecode_data, persent);
 
 	if (maxzoom != written) {
 		if (written > minzoom) {
-			fprintf(stderr, "\n\n\n*** NOTE TILES ONLY COMPLETE THROUGH ZOOM %d ***\n\n\n", written);
+			fprintf(stderr, "\n\n\n*** NOTE TILES ONLY COMPLETE THROUGH ZOOM %d ***\n", written);
 			maxzoom = written;
-			ret = 100;
+			ret = EXIT_INCOMPLETE;
 		} else {
 			fprintf(stderr, "%s: No zoom levels were successfully written\n", *av);
-			exit(EXIT_FAILURE);
+			exit(EXIT_NODATA);
 		}
-	}
-
-	madvise(meta, metapos, MADV_DONTNEED);
-	if (munmap(meta, metapos) != 0) {
-		perror("munmap meta");
-	}
-	if (close(metafd) < 0) {
-		perror("close meta");
 	}
 
 	if (poolpos > 0) {
@@ -2298,6 +2783,9 @@ int read_input(std::vector<source> &sources, char *fname, int maxzoom, int minzo
 		perror("close pool");
 	}
 
+	fclose(shared_nodes);
+
+	// mbtiles-style bounding box and center
 	double minlat = 0, minlon = 0, maxlat = 0, maxlon = 0, midlat = 0, midlon = 0;
 
 	tile2lonlat(midx, midy, maxzoom, &minlon, &maxlat);
@@ -2322,6 +2810,17 @@ int read_input(std::vector<source> &sources, char *fname, int maxzoom, int minzo
 		midlon = maxlon;
 	}
 
+	// antimeridian-aware bounding box
+	double minlat2 = 0, minlon2 = 0, maxlat2 = 0, maxlon2 = 0;
+	// choose whichever of the two calculated bboxes is narrower
+	if (file_bbox2[2] - file_bbox2[0] < file_bbox1[2] - file_bbox1[0]) {
+		tile2lonlat(file_bbox2[0], file_bbox2[1], 32, &minlon2, &maxlat2);
+		tile2lonlat(file_bbox2[2], file_bbox2[3], 32, &maxlon2, &minlat2);
+	} else {
+		tile2lonlat(file_bbox1[0], file_bbox1[1], 32, &minlon2, &maxlat2);
+		tile2lonlat(file_bbox1[2], file_bbox1[3], 32, &maxlon2, &minlat2);
+	}
+
 	std::map<std::string, layermap_entry> merged_lm = merge_layermaps(layermaps);
 
 	for (auto ai = merged_lm.begin(); ai != merged_lm.end(); ++ai) {
@@ -2329,9 +2828,14 @@ int read_input(std::vector<source> &sources, char *fname, int maxzoom, int minzo
 		ai->second.maxzoom = maxzoom;
 	}
 
-	mbtiles_write_metadata(outdb, outdir, fname, minzoom, maxzoom, minlat, minlon, maxlat, maxlon, midlat, midlon, forcetable, attribution, merged_lm, true, description, !prevent[P_TILE_STATS], attribute_descriptions, "tippecanoe", commandline);
+	metadata m = make_metadata(fname, minzoom, maxzoom, minlat, minlon, maxlat, maxlon, minlat2, minlon2, maxlat2, maxlon2, midlat, midlon, attribution, merged_lm, true, description, !prevent[P_TILE_STATS], attribute_descriptions, "tippecanoe", commandline, strategies, basezoom, droprate, retain_points_multiplier);
+	if (outdb != NULL) {
+		mbtiles_write_metadata(outdb, m, forcetable);
+	} else {
+		dir_write_metadata(outdir, m);
+	}
 
-	return ret;
+	return std::make_pair(ret, m);
 }
 
 static bool has_name(struct option *long_options, int *pl) {
@@ -2344,11 +2848,11 @@ static bool has_name(struct option *long_options, int *pl) {
 	return false;
 }
 
-void set_attribute_type(std::map<std::string, int> &attribute_types, const char *arg) {
+void set_attribute_type(std::unordered_map<std::string, int> &attribute_types, const char *arg) {
 	const char *s = strchr(arg, ':');
 	if (s == NULL) {
 		fprintf(stderr, "-T%s option must be in the form -Tname:type\n", arg);
-		exit(EXIT_FAILURE);
+		exit(EXIT_ARGS);
 	}
 
 	std::string name = std::string(arg, s - arg);
@@ -2365,43 +2869,63 @@ void set_attribute_type(std::map<std::string, int> &attribute_types, const char 
 		t = mvt_bool;
 	} else {
 		fprintf(stderr, "Attribute type (%s) must be int, float, string, or bool\n", type.c_str());
-		exit(EXIT_FAILURE);
+		exit(EXIT_ARGS);
 	}
 
 	attribute_types.insert(std::pair<std::string, int>(name, t));
 }
 
-void set_attribute_accum(std::map<std::string, attribute_op> &attribute_accum, const char *arg) {
+void set_attribute_value(const char *arg) {
+	if (*arg == '{') {
+		json_pull *jp = json_begin_string(arg);
+		json_object *o = json_read_tree(jp);
+
+		if (o == NULL) {
+			fprintf(stderr, "%s: --set-attribute %s: %s\n", *av, arg, jp->error);
+			exit(EXIT_JSON);
+		}
+
+		if (o->type != JSON_HASH) {
+			fprintf(stderr, "%s: --set-attribute %s: not a JSON object\n", *av, arg);
+			exit(EXIT_JSON);
+		}
+
+		for (size_t i = 0; i < o->value.object.length; i++) {
+			json_object *k = o->value.object.keys[i];
+			json_object *v = o->value.object.values[i];
+
+			if (k->type != JSON_STRING) {
+				fprintf(stderr, "%s: --set-attribute %s: key %zu not a string\n", *av, arg, i);
+				exit(EXIT_JSON);
+			}
+
+			serial_val val = stringify_value(v, "json", 1, o);
+			set_attributes.emplace(k->value.string.string, val);
+		}
+
+		json_free(o);
+		json_end(jp);
+		return;
+	}
+
 	const char *s = strchr(arg, ':');
 	if (s == NULL) {
-		fprintf(stderr, "-E%s option must be in the form -Ename:method\n", arg);
-		exit(EXIT_FAILURE);
+		fprintf(stderr, "--set-attribute %s option must be in the form --set-attribute name:value\n", arg);
+		exit(EXIT_ARGS);
 	}
 
 	std::string name = std::string(arg, s - arg);
-	std::string type = std::string(s + 1);
-	attribute_op t;
+	std::string value = std::string(s + 1);
 
-	if (type == "sum") {
-		t = op_sum;
-	} else if (type == "product") {
-		t = op_product;
-	} else if (type == "mean") {
-		t = op_mean;
-	} else if (type == "max") {
-		t = op_max;
-	} else if (type == "min") {
-		t = op_min;
-	} else if (type == "concat") {
-		t = op_concat;
-	} else if (type == "comma") {
-		t = op_comma;
+	serial_val val;
+	if (isdigit(value[0]) || value[0] == '-') {
+		val.type = mvt_double;
 	} else {
-		fprintf(stderr, "Attribute method (%s) must be sum, product, mean, max, min, concat, or comma\n", type.c_str());
-		exit(EXIT_FAILURE);
+		val.type = mvt_string;
 	}
 
-	attribute_accum.insert(std::pair<std::string, attribute_op>(name, t));
+	val.s = value;
+	set_attributes.insert(std::pair<std::string, serial_val>(name, val));
 }
 
 void parse_json_source(const char *arg, struct source &src) {
@@ -2410,35 +2934,35 @@ void parse_json_source(const char *arg, struct source &src) {
 
 	if (o == NULL) {
 		fprintf(stderr, "%s: -L%s: %s\n", *av, arg, jp->error);
-		exit(EXIT_FAILURE);
+		exit(EXIT_JSON);
 	}
 
 	if (o->type != JSON_HASH) {
 		fprintf(stderr, "%s: -L%s: not a JSON object\n", *av, arg);
-		exit(EXIT_FAILURE);
+		exit(EXIT_JSON);
 	}
 
 	json_object *fname = json_hash_get(o, "file");
 	if (fname == NULL || fname->type != JSON_STRING) {
 		fprintf(stderr, "%s: -L%s: requires \"file\": filename\n", *av, arg);
-		exit(EXIT_FAILURE);
+		exit(EXIT_JSON);
 	}
 
-	src.file = std::string(fname->string);
+	src.file = std::string(fname->value.string.string);
 
 	json_object *layer = json_hash_get(o, "layer");
 	if (layer != NULL && layer->type == JSON_STRING) {
-		src.layer = std::string(layer->string);
+		src.layer = std::string(layer->value.string.string);
 	}
 
 	json_object *description = json_hash_get(o, "description");
 	if (description != NULL && description->type == JSON_STRING) {
-		src.description = std::string(description->string);
+		src.description = std::string(description->value.string.string);
 	}
 
 	json_object *format = json_hash_get(o, "format");
 	if (format != NULL && format->type == JSON_STRING) {
-		src.format = std::string(format->string);
+		src.format = std::string(format->value.string.string);
 	}
 
 	json_free(o);
@@ -2485,15 +3009,19 @@ int main(int argc, char **argv) {
 	const char *prefilter = NULL;
 	const char *postfilter = NULL;
 	bool guess_maxzoom = false;
+	int minimum_maxzoom = 0;
+	bool guess_cluster_maxzoom = false;
 
 	std::set<std::string> exclude, include;
-	std::map<std::string, int> attribute_types;
-	std::map<std::string, attribute_op> attribute_accum;
+	std::unordered_map<std::string, int> attribute_types;
+	std::unordered_map<std::string, attribute_op> attribute_accum;
 	std::map<std::string, std::string> attribute_descriptions;
 	int exclude_all = 0;
 	int read_parallel = 0;
 	int files_open_at_start;
 	json_object *filter = NULL;
+
+	memsize = calc_memsize();
 
 	for (i = 0; i < 256; i++) {
 		prevent[i] = 0;
@@ -2525,13 +3053,16 @@ int main(int argc, char **argv) {
 		{"Zoom levels", 0, 0, 0},
 		{"maximum-zoom", required_argument, 0, 'z'},
 		{"minimum-zoom", required_argument, 0, 'Z'},
+		{"smallest-maximum-zoom-guess", required_argument, 0, '~'},
 		{"extend-zooms-if-still-dropping", no_argument, &additional[A_EXTEND_ZOOMS], 1},
+		{"extend-zooms-if-still-dropping-maximum", required_argument, 0, '~'},
 		{"one-tile", required_argument, 0, 'R'},
 
 		{"Tile resolution", 0, 0, 0},
 		{"full-detail", required_argument, 0, 'd'},
 		{"low-detail", required_argument, 0, 'D'},
 		{"minimum-detail", required_argument, 0, 'm'},
+		{"extra-detail", required_argument, 0, '~'},
 
 		{"Filtering feature attributes", 0, 0, 0},
 		{"exclude", required_argument, 0, 'x'},
@@ -2545,17 +3076,25 @@ int main(int argc, char **argv) {
 		{"empty-csv-columns-are-null", no_argument, &prevent[P_EMPTY_CSV_COLUMNS], 1},
 		{"convert-stringified-ids-to-numbers", no_argument, &additional[A_CONVERT_NUMERIC_IDS], 1},
 		{"use-attribute-for-id", required_argument, 0, '~'},
+		{"single-precision", no_argument, &prevent[P_SINGLE_PRECISION], 1},
+		{"set-attribute", required_argument, 0, '~'},
 
 		{"Filtering features by attributes", 0, 0, 0},
 		{"feature-filter-file", required_argument, 0, 'J'},
 		{"feature-filter", required_argument, 0, 'j'},
+		{"unidecode-data", required_argument, 0, '~'},
 
 		{"Dropping a fixed fraction of features by zoom level", 0, 0, 0},
 		{"drop-rate", required_argument, 0, 'r'},
+		{"retain-points-multiplier", required_argument, 0, '~'},
 		{"base-zoom", required_argument, 0, 'B'},
+		{"drop-denser", required_argument, 0, '~'},
+		{"limit-base-zoom-to-maximum-zoom", no_argument, &prevent[P_BASEZOOM_ABOVE_MAXZOOM], 1},
 		{"drop-lines", no_argument, &additional[A_LINE_DROP], 1},
 		{"drop-polygons", no_argument, &additional[A_POLYGON_DROP], 1},
 		{"cluster-distance", required_argument, 0, 'K'},
+		{"cluster-maxzoom", required_argument, 0, 'k'},
+		{"preserve-point-density-threshold", required_argument, 0, '~'},
 
 		{"Dropping or merging a fraction of features to keep under tile size limits", 0, 0, 0},
 		{"drop-densest-as-needed", no_argument, &additional[A_DROP_DENSEST_AS_NEEDED], 1},
@@ -2575,8 +3114,12 @@ int main(int argc, char **argv) {
 		{"simplification", required_argument, 0, 'S'},
 		{"no-line-simplification", no_argument, &prevent[P_SIMPLIFY], 1},
 		{"simplify-only-low-zooms", no_argument, &prevent[P_SIMPLIFY_LOW], 1},
+		{"simplification-at-maximum-zoom", required_argument, 0, '~'},
 		{"no-tiny-polygon-reduction", no_argument, &prevent[P_TINY_POLYGON_REDUCTION], 1},
+		{"no-tiny-polygon-reduction-at-maximum-zoom", no_argument, &prevent[P_TINY_POLYGON_REDUCTION_AT_MAXZOOM], 1},
+		{"tiny-polygon-size", required_argument, 0, '~'},
 		{"no-simplification-of-shared-nodes", no_argument, &prevent[P_SIMPLIFY_SHARED_NODES], 1},
+		{"visvalingam", no_argument, &additional[A_VISVALINGAM], 1},
 
 		{"Attempts to improve shared polygon boundaries", 0, 0, 0},
 		{"detect-shared-borders", no_argument, &additional[A_DETECT_SHARED_BORDERS], 1},
@@ -2593,6 +3136,10 @@ int main(int argc, char **argv) {
 		{"coalesce", no_argument, &additional[A_COALESCE], 1},
 		{"reverse", no_argument, &additional[A_REVERSE], 1},
 		{"hilbert", no_argument, &additional[A_HILBERT], 1},
+		{"order-by", required_argument, 0, '~'},
+		{"order-descending-by", required_argument, 0, '~'},
+		{"order-smallest-first", no_argument, 0, '~'},
+		{"order-largest-first", no_argument, 0, '~'},
 
 		{"Adding calculated attributes", 0, 0, 0},
 		{"calculate-feature-density", no_argument, &additional[A_CALCULATE_FEATURE_DENSITY], 1},
@@ -2603,6 +3150,7 @@ int main(int argc, char **argv) {
 		{"use-source-polygon-winding", no_argument, &prevent[P_USE_SOURCE_POLYGON_WINDING], 1},
 		{"reverse-source-polygon-winding", no_argument, &prevent[P_REVERSE_SOURCE_POLYGON_WINDING], 1},
 		{"clip-bounding-box", required_argument, 0, '~'},
+		{"convert-polygons-to-label-points", no_argument, &additional[A_GENERATE_POLYGON_LABEL_POINTS], 1},
 
 		{"Filtering tile contents", 0, 0, 0},
 		{"prefilter", required_argument, 0, 'C'},
@@ -2611,6 +3159,8 @@ int main(int argc, char **argv) {
 		{"Setting or disabling tile size limits", 0, 0, 0},
 		{"maximum-tile-bytes", required_argument, 0, 'M'},
 		{"maximum-tile-features", required_argument, 0, 'O'},
+		{"limit-tile-feature-count", required_argument, 0, '~'},
+		{"limit-tile-feature-count-at-maximum-zoom", required_argument, 0, '~'},
 		{"no-feature-limit", no_argument, &prevent[P_FEATURE_LIMIT], 1},
 		{"no-tile-size-limit", no_argument, &prevent[P_KILOBYTE_LIMIT], 1},
 		{"no-tile-compression", no_argument, &prevent[P_TILE_COMPRESSION], 1},
@@ -2626,6 +3176,7 @@ int main(int argc, char **argv) {
 		{"quiet", no_argument, 0, 'q'},
 		{"no-progress-indicator", no_argument, 0, 'Q'},
 		{"progress-interval", required_argument, 0, 'U'},
+		{"json-progress", no_argument, 0, 'u'},
 		{"version", no_argument, 0, 'v'},
 
 		{"", 0, 0, 0},
@@ -2665,7 +3216,7 @@ int main(int argc, char **argv) {
 			if (long_options[lo].flag != NULL) {
 				if (*long_options[lo].flag != 0) {
 					fprintf(stderr, "Internal error: reused %s\n", long_options[lo].name);
-					exit(EXIT_FAILURE);
+					exit(EXIT_IMPOSSIBLE);
 				}
 				*long_options[lo].flag = 1;
 			}
@@ -2700,13 +3251,69 @@ int main(int argc, char **argv) {
 					clipbboxes.push_back(clip);
 				} else {
 					fprintf(stderr, "%s: Can't parse bounding box --%s=%s\n", argv[0], opt, optarg);
-					exit(EXIT_FAILURE);
+					exit(EXIT_ARGS);
 				}
 			} else if (strcmp(opt, "use-attribute-for-id") == 0) {
 				attribute_for_id = optarg;
+			} else if (strcmp(opt, "set-attribute") == 0) {
+				set_attribute_value(optarg);
+			} else if (strcmp(opt, "smallest-maximum-zoom-guess") == 0) {
+				maxzoom = MAX_ZOOM;
+				guess_maxzoom = true;
+				minimum_maxzoom = atoi_require(optarg, "Minimum maxzoom");
+				if (minimum_maxzoom > MAX_ZOOM) {
+					fprintf(stderr, "%s: %s: minimum maxzoom can be at most %d\n", argv[0], optarg, MAX_ZOOM);
+					exit(EXIT_ARGS);
+				}
+			} else if (strcmp(opt, "tiny-polygon-size") == 0) {
+				tiny_polygon_size = atoi(optarg);
+			} else if (strcmp(opt, "extra-detail") == 0) {
+				extra_detail = atoi_require(optarg, "Extra detail");
+				if (extra_detail > 30) {
+					// So the maximum geometry delta of just under 2 tile extents
+					// is less than 2^31
+
+					fprintf(stderr, "%s: --extra-detail can be at most 30\n", argv[0]);
+					exit(EXIT_ARGS);
+				}
+			} else if (strcmp(opt, "order-by") == 0) {
+				order_by.push_back(order_field(optarg, false));
+			} else if (strcmp(opt, "order-descending-by") == 0) {
+				order_by.push_back(order_field(optarg, true));
+			} else if (strcmp(opt, "order-smallest-first") == 0) {
+				order_by.push_back(order_field(ORDER_BY_SIZE, false));
+				order_by_size = true;
+			} else if (strcmp(opt, "order-largest-first") == 0) {
+				order_by.push_back(order_field(ORDER_BY_SIZE, true));
+				order_by_size = true;
+			} else if (strcmp(opt, "simplification-at-maximum-zoom") == 0) {
+				maxzoom_simplification = atof_require(optarg, "Mazoom simplification");
+				if (maxzoom_simplification <= 0) {
+					fprintf(stderr, "%s: --simplification-at-maximum-zoom must be > 0\n", argv[0]);
+					exit(EXIT_ARGS);
+				}
+				break;
+			} else if (strcmp(opt, "limit-tile-feature-count") == 0) {
+				limit_tile_feature_count = atoll_require(optarg, "Limit tile feature count");
+			} else if (strcmp(opt, "limit-tile-feature-count-at-maximum-zoom") == 0) {
+				limit_tile_feature_count_at_maxzoom = atoll_require(optarg, "Limit tile feature count at maxzoom");
+			} else if (strcmp(opt, "drop-denser") == 0) {
+				drop_denser = atoi_require(optarg, "Drop denser rate");
+				if (drop_denser > 100) {
+					fprintf(stderr, "%s: --drop-denser can be at most 100\n", argv[0]);
+					exit(EXIT_ARGS);
+				}
+			} else if (strcmp(opt, "preserve-point-density-threshold") == 0) {
+				preserve_point_density_threshold = atoll_require(optarg, "Preserve point density threshold");
+			} else if (strcmp(opt, "extend-zooms-if-still-dropping-maximum") == 0) {
+				extend_zooms_max = atoll_require(optarg, "Maximum number by which to extend zooms");
+			} else if (strcmp(opt, "retain-points-multiplier") == 0) {
+				retain_points_multiplier = atoll_require(optarg, "Multiply the fraction of points retained by zoom level");
+			} else if (strcmp(opt, "unidecode-data") == 0) {
+				unidecode_data = read_unidecode(optarg);
 			} else {
 				fprintf(stderr, "%s: Unrecognized option --%s\n", argv[0], opt);
-				exit(EXIT_FAILURE);
+				exit(EXIT_ARGS);
 			}
 			break;
 		}
@@ -2735,7 +3342,7 @@ int main(int argc, char **argv) {
 				char *cp = strchr(optarg, ':');
 				if (cp == NULL || cp == optarg) {
 					fprintf(stderr, "%s: -L requires layername:file\n", argv[0]);
-					exit(EXIT_FAILURE);
+					exit(EXIT_ARGS);
 				}
 				src.layer = std::string(optarg).substr(0, cp - optarg);
 				src.file = std::string(cp + 1);
@@ -2766,7 +3373,7 @@ int main(int argc, char **argv) {
 				justy = y;
 			} else {
 				fprintf(stderr, "--one-tile argument must be z/x/y\n");
-				exit(EXIT_FAILURE);
+				exit(EXIT_ARGS);
 			}
 			break;
 		}
@@ -2783,13 +3390,13 @@ int main(int argc, char **argv) {
 				}
 				if (basezoom_marker_width == 0 || atof_require(optarg + 1, "Marker width") == 0) {
 					fprintf(stderr, "%s: Must specify value >0 with -B%c\n", argv[0], optarg[0]);
-					exit(EXIT_FAILURE);
+					exit(EXIT_ARGS);
 				}
 			} else {
 				basezoom = atoi_require(optarg, "Basezoom");
 				if (basezoom == 0 && strcmp(optarg, "0") != 0) {
 					fprintf(stderr, "%s: Couldn't understand -B%s\n", argv[0], optarg);
-					exit(EXIT_FAILURE);
+					exit(EXIT_ARGS);
 				}
 			}
 			break;
@@ -2798,7 +3405,16 @@ int main(int argc, char **argv) {
 			cluster_distance = atoi_require(optarg, "Cluster distance");
 			if (cluster_distance > 255) {
 				fprintf(stderr, "%s: --cluster-distance %d is too big; limit is 255\n", argv[0], cluster_distance);
-				exit(EXIT_FAILURE);
+				exit(EXIT_ARGS);
+			}
+			break;
+
+		case 'k':
+			if (strcmp(optarg, "g") == 0) {
+				cluster_maxzoom = MAX_ZOOM - 1;
+				guess_cluster_maxzoom = true;
+			} else {
+				cluster_maxzoom = atoi_require(optarg, "Cluster maxzoom");
 			}
 			break;
 
@@ -2809,7 +3425,7 @@ int main(int argc, char **argv) {
 				// is less than 2^31
 
 				fprintf(stderr, "%s: --full-detail can be at most 30\n", argv[0]);
-				exit(EXIT_FAILURE);
+				exit(EXIT_ARGS);
 			}
 			break;
 
@@ -2817,7 +3433,7 @@ int main(int argc, char **argv) {
 			low_detail = atoi_require(optarg, "Low detail");
 			if (low_detail > 30) {
 				fprintf(stderr, "%s: --low-detail can be at most 30\n", argv[0]);
-				exit(EXIT_FAILURE);
+				exit(EXIT_ARGS);
 			}
 			break;
 
@@ -2828,11 +3444,11 @@ int main(int argc, char **argv) {
 		case 'o':
 			if (out_mbtiles != NULL) {
 				fprintf(stderr, "%s: Can't specify both %s and %s as output\n", argv[0], out_mbtiles, optarg);
-				exit(EXIT_FAILURE);
+				exit(EXIT_ARGS);
 			}
 			if (out_dir != NULL) {
 				fprintf(stderr, "%s: Can't specify both %s and %s as output\n", argv[0], out_dir, optarg);
-				exit(EXIT_FAILURE);
+				exit(EXIT_ARGS);
 			}
 			out_mbtiles = optarg;
 			break;
@@ -2840,11 +3456,11 @@ int main(int argc, char **argv) {
 		case 'e':
 			if (out_mbtiles != NULL) {
 				fprintf(stderr, "%s: Can't specify both %s and %s as output\n", argv[0], out_mbtiles, optarg);
-				exit(EXIT_FAILURE);
+				exit(EXIT_ARGS);
 			}
 			if (out_dir != NULL) {
 				fprintf(stderr, "%s: Can't specify both %s and %s as output\n", argv[0], out_dir, optarg);
-				exit(EXIT_FAILURE);
+				exit(EXIT_ARGS);
 			}
 			out_dir = optarg;
 			break;
@@ -2866,7 +3482,7 @@ int main(int argc, char **argv) {
 			char *cp = strchr(optarg, ':');
 			if (cp == NULL || cp == optarg) {
 				fprintf(stderr, "%s: -Y requires attribute:description\n", argv[0]);
-				exit(EXIT_FAILURE);
+				exit(EXIT_ARGS);
 			}
 			std::string attrib = std::string(optarg).substr(0, cp - optarg);
 			std::string desc = std::string(cp + 1);
@@ -2884,6 +3500,8 @@ int main(int argc, char **argv) {
 		case 'r':
 			if (strcmp(optarg, "g") == 0) {
 				droprate = -2;
+			} else if (strcmp(optarg, "p") == 0) {
+				droprate = -3;
 			} else if (optarg[0] == 'g' || optarg[0] == 'f') {
 				droprate = -2;
 				if (optarg[0] == 'g') {
@@ -2893,7 +3511,7 @@ int main(int argc, char **argv) {
 				}
 				if (basezoom_marker_width == 0 || atof_require(optarg + 1, "Marker width") == 0) {
 					fprintf(stderr, "%s: Must specify value >0 with -r%c\n", argv[0], optarg[0]);
-					exit(EXIT_FAILURE);
+					exit(EXIT_ARGS);
 				}
 			} else {
 				droprate = atof_require(optarg, "Drop rate");
@@ -2908,7 +3526,7 @@ int main(int argc, char **argv) {
 				// half a tile beyond the other.
 
 				fprintf(stderr, "%s: --buffer can be at most 127\n", argv[0]);
-				exit(EXIT_FAILURE);
+				exit(EXIT_ARGS);
 			}
 			break;
 
@@ -2939,6 +3557,11 @@ int main(int argc, char **argv) {
 			quiet_progress = 1;
 			break;
 
+		case 'u':
+			quiet = 1;
+			logger.json_enabled = true;
+			break;
+
 		case 'U':
 			progress_interval = atof_require(optarg, "Progress interval");
 			break;
@@ -2950,7 +3573,7 @@ int main(int argc, char **argv) {
 					prevent[*cp & 0xFF] = 1;
 				} else {
 					fprintf(stderr, "%s: Unknown option -p%c\n", argv[0], *cp);
-					exit(EXIT_FAILURE);
+					exit(EXIT_ARGS);
 				}
 			}
 			break;
@@ -2963,7 +3586,7 @@ int main(int argc, char **argv) {
 					additional[*cp & 0xFF] = 1;
 				} else {
 					fprintf(stderr, "%s: Unknown option -a%c\n", argv[0], *cp);
-					exit(EXIT_FAILURE);
+					exit(EXIT_ARGS);
 				}
 			}
 			break;
@@ -2985,7 +3608,7 @@ int main(int argc, char **argv) {
 			simplification = atof_require(optarg, "Simplification");
 			if (simplification <= 0) {
 				fprintf(stderr, "%s: --simplification must be > 0\n", argv[0]);
-				exit(EXIT_FAILURE);
+				exit(EXIT_ARGS);
 			}
 			break;
 
@@ -3010,7 +3633,7 @@ int main(int argc, char **argv) {
 			break;
 
 		case 'E':
-			set_attribute_accum(attribute_accum, optarg);
+			set_attribute_accum(attribute_accum, optarg, argv);
 			break;
 
 		default: {
@@ -3047,7 +3670,7 @@ int main(int argc, char **argv) {
 			if (i == 'H') {
 				exit(EXIT_SUCCESS);
 			} else {
-				exit(EXIT_FAILURE);
+				exit(EXIT_ARGS);
 			}
 		}
 		}
@@ -3078,15 +3701,45 @@ int main(int argc, char **argv) {
 	files_open_at_start = open("/dev/null", O_RDONLY | O_CLOEXEC);
 	if (files_open_at_start < 0) {
 		perror("open /dev/null");
-		exit(EXIT_FAILURE);
+		exit(EXIT_OPEN);
 	}
 	if (close(files_open_at_start) != 0) {
 		perror("close");
-		exit(EXIT_FAILURE);
+		exit(EXIT_CLOSE);
 	}
 
 	if (full_detail <= 0) {
 		full_detail = 12;
+	}
+
+	if (droprate == -3 && !guess_maxzoom) {
+		fprintf(stderr, "Can't use -rp without either -zg or --smallest-maximum-zoom-guess\n");
+		exit(EXIT_ARGS);
+	}
+
+	if (maxzoom > MAX_ZOOM) {
+		maxzoom = MAX_ZOOM;
+		fprintf(stderr, "Highest supported zoom is -z%d\n", maxzoom);
+	}
+
+	// Need two checks: one for geometry representation, the other for
+	// index traversal when guessing base zoom and drop rate
+
+	// This previously dropped the maxzoom rather than the detail when they were in conflict,
+	// which proved to be annoying.
+	if (!guess_maxzoom) {
+		if (maxzoom > 32 - full_detail) {
+			full_detail = 32 - maxzoom;
+			fprintf(stderr, "Highest supported detail with maxzoom %d is %d\n", maxzoom, full_detail);
+		}
+		if (maxzoom > 33 - low_detail) {  // that is, maxzoom - 1 > 32 - low_detail
+			low_detail = 33 - maxzoom;
+			fprintf(stderr, "Highest supported low detail with maxzoom %d is %d\n", maxzoom, low_detail);
+		}
+	}
+	if (minzoom > maxzoom) {
+		fprintf(stderr, "%s: Minimum zoom -Z%d cannot be greater than maxzoom -z%d\n", argv[0], minzoom, maxzoom);
+		exit(EXIT_ARGS);
 	}
 
 	if (full_detail < min_detail) {
@@ -3099,39 +3752,22 @@ int main(int argc, char **argv) {
 		fprintf(stderr, "%s: Reducing minimum detail to match low detail %d\n", argv[0], min_detail);
 	}
 
-	// Need two checks: one for geometry representation, the other for
-	// index traversal when guessing base zoom and drop rate
-	if (!guess_maxzoom) {
-		if (maxzoom > 32 - full_detail) {
-			maxzoom = 32 - full_detail;
-			fprintf(stderr, "Highest supported zoom with detail %d is %d\n", full_detail, maxzoom);
-		}
-		if (maxzoom > 33 - low_detail) {  // that is, maxzoom - 1 > 32 - low_detail
-			maxzoom = 33 - low_detail;
-			fprintf(stderr, "Highest supported zoom with low detail %d is %d\n", low_detail, maxzoom);
-		}
-	}
-	if (maxzoom > MAX_ZOOM) {
-		maxzoom = MAX_ZOOM;
-		fprintf(stderr, "Highest supported zoom is %d\n", maxzoom);
-	}
-
-	if (minzoom > maxzoom) {
-		fprintf(stderr, "%s: Minimum zoom -Z%d cannot be greater than maxzoom -z%d\n", argv[0], minzoom, maxzoom);
-		exit(EXIT_FAILURE);
-	}
-
-	if (basezoom == -1) {
+	if (basezoom == -1) {  // basezoom unspecified
 		if (!guess_maxzoom) {
 			basezoom = maxzoom;
 		}
 	}
 
-	geometry_scale = 32 - (full_detail + maxzoom);
-	if (geometry_scale < 0) {
+	if (extra_detail >= 0 || prevent[P_SIMPLIFY_SHARED_NODES] || additional[A_EXTEND_ZOOMS] || extend_zooms_max > 0) {
 		geometry_scale = 0;
-		if (!guess_maxzoom) {
-			fprintf(stderr, "Full detail + maxzoom > 32, so you are asking for more detail than is available.\n");
+	} else {
+		geometry_scale = 32 - (full_detail + maxzoom);
+		if (geometry_scale < 0) {
+			geometry_scale = 0;
+			if (!guess_maxzoom) {
+				// This shouldn't be able to happen any more. Can it still?
+				fprintf(stderr, "Full detail + maxzoom > 32, so you are asking for more detail than is available.\n");
+			}
 		}
 	}
 
@@ -3144,17 +3780,21 @@ int main(int argc, char **argv) {
 
 	if (out_mbtiles == NULL && out_dir == NULL) {
 		fprintf(stderr, "%s: must specify -o out.mbtiles or -e directory\n", argv[0]);
-		exit(EXIT_FAILURE);
+		exit(EXIT_ARGS);
 	}
 
 	if (out_mbtiles != NULL && out_dir != NULL) {
 		fprintf(stderr, "%s: Options -o and -e cannot be used together\n", argv[0]);
-		exit(EXIT_FAILURE);
+		exit(EXIT_ARGS);
 	}
 
 	if (out_mbtiles != NULL) {
 		if (force) {
 			unlink(out_mbtiles);
+		} else {
+			if (pmtiles_has_suffix(out_mbtiles)) {
+				check_pmtiles(out_mbtiles, argv, forcetable);
+			}
 		}
 
 		outdb = mbtiles_open(out_mbtiles, "tippecanoe", forcetable);
@@ -3175,7 +3815,7 @@ int main(int argc, char **argv) {
 	if (sources.size() == 0) {
 		struct source src;
 		src.layer = "";
-		src.file = "";  // standard input
+		src.file = "";	// standard input
 		sources.push_back(src);
 	}
 
@@ -3187,10 +3827,21 @@ int main(int argc, char **argv) {
 
 	long long file_bbox[4] = {UINT_MAX, UINT_MAX, 0, 0};
 
-	ret = read_input(sources, name ? name : out_mbtiles ? out_mbtiles : out_dir, maxzoom, minzoom, basezoom, basezoom_marker_width, outdb, out_dir, &exclude, &include, exclude_all, filter, droprate, buffer, tmpdir, gamma, read_parallel, forcetable, attribution, gamma != 0, file_bbox, prefilter, postfilter, description, guess_maxzoom, &attribute_types, argv[0], &attribute_accum, attribute_descriptions, commandline, persent);
+	long long file_bbox1[4] = {0xFFFFFFFF, 0xFFFFFFFF, 0, 0};	      // standard -180 to 180 world plane
+	long long file_bbox2[4] = {0x1FFFFFFFF, 0xFFFFFFFF, 0x100000000, 0};  // 0 to 360 world plane
+
+	auto input_ret = read_input(sources, name ? name : out_mbtiles ? out_mbtiles
+								       : out_dir,
+				    maxzoom, minzoom, basezoom, basezoom_marker_width, outdb, out_dir, &exclude, &include, exclude_all, filter, droprate, buffer, tmpdir, gamma, read_parallel, forcetable, attribution, gamma != 0, file_bbox, file_bbox1, file_bbox2, prefilter, postfilter, description, guess_maxzoom, guess_cluster_maxzoom, &attribute_types, argv[0], &attribute_accum, attribute_descriptions, commandline, minimum_maxzoom, persent);
+
+	ret = std::get<0>(input_ret);
 
 	if (outdb != NULL) {
 		mbtiles_close(outdb, argv[0]);
+	}
+
+	if (pmtiles_has_suffix(out_mbtiles)) {
+		mbtiles_map_image_to_pmtiles(out_mbtiles, std::get<1>(input_ret), prevent[P_TILE_COMPRESSION] == 0, quiet, quiet_progress);
 	}
 
 #ifdef MTRACE
@@ -3201,7 +3852,7 @@ int main(int argc, char **argv) {
 	// i < files_open_at_start is not an error, because reading from a pipe closes stdin
 	if (i > files_open_at_start) {
 		fprintf(stderr, "Internal error: did not close all files: %d\n", i);
-		exit(EXIT_FAILURE);
+		exit(EXIT_IMPOSSIBLE);
 	}
 
 	if (filter != NULL) {
@@ -3216,7 +3867,7 @@ int mkstemp_cloexec(char *name) {
 	if (fd >= 0) {
 		if (fcntl(fd, F_SETFD, FD_CLOEXEC) < 0) {
 			perror("cloexec for temporary file");
-			exit(EXIT_FAILURE);
+			exit(EXIT_OPEN);
 		}
 	}
 	return fd;

@@ -11,7 +11,6 @@
 #define A_PREFER_RADIX_SORT ((int) 'R')
 #define A_CALCULATE_FEATURE_DENSITY ((int) 'g')
 #define A_INCREASE_GAMMA_AS_NEEDED ((int) 'G')
-#define A_MERGE_POLYGONS_AS_NEEDED ((int) 'm')
 #define A_DROP_DENSEST_AS_NEEDED ((int) 's')
 #define A_DROP_FRACTION_AS_NEEDED ((int) 'd')
 #define A_DROP_SMALLEST_AS_NEEDED ((int) 'n')
@@ -25,10 +24,13 @@
 #define A_GENERATE_IDS ((int) 'i')
 #define A_CONVERT_NUMERIC_IDS ((int) 'I')
 #define A_HILBERT ((int) 'h')
+#define A_VISVALINGAM ((int) 'v')
+#define A_GENERATE_POLYGON_LABEL_POINTS ((int) 'P')
 
 #define P_SIMPLIFY ((int) 's')
 #define P_SIMPLIFY_LOW ((int) 'S')
 #define P_SIMPLIFY_SHARED_NODES ((int) 'n')
+#define P_SINGLE_PRECISION ((int) 'N')
 #define P_FEATURE_LIMIT ((int) 'f')
 #define P_KILOBYTE_LIMIT ((int) 'k')
 #define P_DYNAMIC_DROP ((int) 'd')
@@ -37,11 +39,13 @@
 #define P_CLIPPING ((int) 'c')
 #define P_DUPLICATION ((int) 'D')
 #define P_TINY_POLYGON_REDUCTION ((int) 't')
+#define P_TINY_POLYGON_REDUCTION_AT_MAXZOOM ((int) 'T')
 #define P_TILE_COMPRESSION ((int) 'C')
 #define P_TILE_STATS ((int) 'g')
 #define P_USE_SOURCE_POLYGON_WINDING ((int) 'w')
 #define P_REVERSE_SOURCE_POLYGON_WINDING ((int) 'W')
 #define P_EMPTY_CSV_COLUMNS ((int) 'e')
+#define P_BASEZOOM_ABOVE_MAXZOOM ((int) 'b')
 
 extern int prevent[256];
 extern int additional[256];
