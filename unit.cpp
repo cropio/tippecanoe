@@ -1,8 +1,9 @@
+#ifndef TARGET_OS_IPHONE
+
 #define CATCH_CONFIG_MAIN
 #include "catch/catch.hpp"
 #include "text.hpp"
 
-#ifndef TARGET_OS_IPHONE
 TEST_CASE("UTF-8 enforcement", "[utf8]") {
 	REQUIRE(check_utf8("") == std::string(""));
 	REQUIRE(check_utf8("hello world") == std::string(""));
